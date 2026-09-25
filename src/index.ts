@@ -1,7 +1,7 @@
 import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, compact, generateBranchSummary, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
@@ -228,6 +228,28 @@ function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachme
 }
 
 let sharedSession: SessionState | null = null;
+
+// A process started with CLAUDE_BRIDGE_FORK_FROM answers from a copy of another
+// process's Claude Code session. The copy is made before the first query (forkSession
+// is async; syncSharedSession is not) and adopted by the first sync, which then takes
+// the REUSE path: the copy holds exactly the source's prefix, so the fork's first turn
+// reads it from the prompt cache instead of rewriting it. The parent only sets the
+// variable when the source's cursor equals the history it copied into the fork.
+let pendingFork: string | null = null;
+
+async function prepareForkFrom(sourceSessionId: string, cwd: string): Promise<string> {
+	const { sessionId } = await forkSession(sourceSessionId, { dir: cwd });
+	pendingFork = sessionId;
+	debug(`fork-from: copied session ${sourceSessionId.slice(0, 8)} → ${sessionId.slice(0, 8)}`);
+	return sessionId;
+}
+
+// Published for the process that spawns forks: which Claude Code session this process
+// resumes, and how many pi messages it covers. Read-only; null before the first turn.
+Object.defineProperty(globalThis, Symbol.for("pi-claude-bridge.session"), {
+	configurable: true,
+	get: () => (sharedSession ? { sessionId: sharedSession.sessionId, cursor: sharedSession.cursor } : null),
+});
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
@@ -655,6 +677,13 @@ function syncSharedSession(
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
+	if (!sharedSession && pendingFork) {
+		sharedSession = { sessionId: pendingFork, cursor: priorMessages.length, cwd };
+		pendingFork = null;
+		debug(`syncResult: path=fork-from sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+		return { sessionId: sharedSession.sessionId };
+	}
+
 	// REUSE path
 	//
 	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
@@ -743,7 +772,9 @@ function syncSharedSession(
 export const __test = {
 	resetSharedSession() {
 		sharedSession = null;
+		pendingFork = null;
 	},
+	prepareForkFrom,
 	setSharedSession(state: SessionState | null) {
 		sharedSession = state;
 	},
@@ -2115,6 +2146,9 @@ export default function (pi: ExtensionAPI) {
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
+	// Once per process: a failed copy falls back to a normal rebuild rather than
+	// retrying on every turn.
+	let forkPrepared = false;
 	let lastSystemPromptOptions: RecordOptions | undefined;
 	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
 		customPrompt?: string;
@@ -2132,7 +2166,12 @@ export default function (pi: ExtensionAPI) {
 			skills: hasRead ? options?.skills ?? [] : [],
 		}, source);
 	}
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event) => {
+		const forkFrom = process.env.CLAUDE_BRIDGE_FORK_FROM;
+		if (forkFrom && !sharedSession && !forkPrepared) {
+			forkPrepared = true;
+			await prepareForkFrom(forkFrom, process.cwd());
+		}
 		lastSystemPromptOptions = event.systemPromptOptions;
 		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
 	});
