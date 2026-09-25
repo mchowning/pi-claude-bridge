@@ -21,6 +21,11 @@ describe("published session", () => {
 		__test.setSharedSession({ sessionId: "abc", cursor: 4, cwd: "/tmp" });
 		assert.deepEqual(globalThis[SESSION_KEY], { sessionId: "abc", cursor: 4 });
 	});
+
+	it("reports null while the session is due for a rebuild, since its file no longer matches pi", () => {
+		__test.setSharedSession({ sessionId: "abc", cursor: 4, cwd: "/tmp", needsRebuild: true });
+		assert.equal(globalThis[SESSION_KEY], null);
+	});
 });
 
 describe("fork from another session", () => {

@@ -245,10 +245,14 @@ async function prepareForkFrom(sourceSessionId: string, cwd: string): Promise<st
 }
 
 // Published for the process that spawns forks: which Claude Code session this process
-// resumes, and how many pi messages it covers. Read-only; null before the first turn.
+// resumes, and how many pi messages it covers. Read-only; null before the first turn and
+// while the session is due for a rebuild, when its file no longer matches pi's history.
 Object.defineProperty(globalThis, Symbol.for("pi-claude-bridge.session"), {
 	configurable: true,
-	get: () => (sharedSession ? { sessionId: sharedSession.sessionId, cursor: sharedSession.cursor } : null),
+	get: () =>
+		sharedSession && !sharedSession.needsRebuild
+			? { sessionId: sharedSession.sessionId, cursor: sharedSession.cursor }
+			: null,
 });
 
 // Convert pi messages to Anthropic API format for session import.
