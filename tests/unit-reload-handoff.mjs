@@ -25,8 +25,8 @@ function activateWithMockPi(activateFn) {
 	};
 }
 
-const ctxFor = (sessionFile) => ({
-	sessionManager: { getSessionFile: () => sessionFile },
+const ctxFor = (sessionFile, sessionId = "pi-main") => ({
+	sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => sessionId },
 	modelRegistry: { getProvider: () => true },
 	ui: undefined,
 	mode: "rpc",
@@ -38,47 +38,47 @@ describe("reload handoff", () => {
 
 	it("the reloaded instance resumes the same Claude Code session and publishes it", async () => {
 		const emitOld = activateWithMockPi(activate);
-		__test.setSharedSession(SESSION);
+		__test.setSharedSession("pi-main", SESSION);
 		emitOld("session_shutdown", { reason: "reload" }, ctxFor("/sessions/main.jsonl"));
 
 		const fresh = await import("../src/index.js?reloaded");
 		const emitNew = activateWithMockPi(fresh.default);
 		emitNew("session_start", { reason: "reload" }, ctxFor("/sessions/main.jsonl"));
 
-		assert.deepEqual(fresh.__test.getSharedSession(), SESSION);
-		assert.deepEqual(globalThis[SESSION_KEY], { sessionId: "cc-main", cursor: 12 });
+		assert.deepEqual(fresh.__test.getSharedSession("pi-main"), SESSION);
+		assert.deepEqual(globalThis[SESSION_KEY]("pi-main"), { sessionId: "cc-main", cursor: 12 });
 	});
 
 	it("an instance that starts for any other reason does not adopt it", async () => {
 		const emitOld = activateWithMockPi(activate);
-		__test.setSharedSession(SESSION);
+		__test.setSharedSession("pi-main", SESSION);
 		emitOld("session_shutdown", { reason: "reload" }, ctxFor("/sessions/main.jsonl"));
 
 		const child = await import("../src/index.js?isolated-subagent");
 		activateWithMockPi(child.default)("session_start", { reason: "startup" }, ctxFor("/sessions/main.jsonl"));
 
-		assert.equal(child.__test.getSharedSession(), null);
+		assert.equal(child.__test.getSharedSession("pi-main"), null);
 	});
 
 	it("a reload of a different pi session does not adopt it", async () => {
 		const emitOld = activateWithMockPi(activate);
-		__test.setSharedSession(SESSION);
+		__test.setSharedSession("pi-main", SESSION);
 		emitOld("session_shutdown", { reason: "reload" }, ctxFor("/sessions/main.jsonl"));
 
 		const other = await import("../src/index.js?other-session");
 		activateWithMockPi(other.default)("session_start", { reason: "reload" }, ctxFor("/sessions/other.jsonl"));
 
-		assert.equal(other.__test.getSharedSession(), null);
+		assert.equal(other.__test.getSharedSession("pi-main"), null);
 	});
 
 	it("quitting hands nothing on", async () => {
 		const emitOld = activateWithMockPi(activate);
-		__test.setSharedSession(SESSION);
+		__test.setSharedSession("pi-main", SESSION);
 		emitOld("session_shutdown", { reason: "quit" }, ctxFor("/sessions/main.jsonl"));
 
 		const next = await import("../src/index.js?after-quit");
 		activateWithMockPi(next.default)("session_start", { reason: "reload" }, ctxFor("/sessions/main.jsonl"));
 
-		assert.equal(next.__test.getSharedSession(), null);
+		assert.equal(next.__test.getSharedSession("pi-main"), null);
 	});
 });
