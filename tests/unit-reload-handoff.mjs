@@ -26,7 +26,13 @@ function activateWithMockPi(activateFn) {
 }
 
 const ctxFor = (sessionFile, sessionId = "pi-main") => ({
-	sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => sessionId },
+	sessionManager: {
+		getSessionFile: () => sessionFile,
+		getSessionId: () => sessionId,
+		getEntries: () => [],
+		getBranch: () => [],
+		buildSessionProjection: () => ({ messages: [] }),
+	},
 	modelRegistry: { getProvider: () => true },
 	ui: undefined,
 	mode: "rpc",
