@@ -42,6 +42,14 @@ the failure in five minutes.
 
 Five wrong conclusions across two sessions came from skipping the above.
 
+## Cache-flow matrix
+
+Any change to session sync (`syncSharedSession`, the completion capture, rebuild marks),
+fork-from, the `/reload` handoff or the session pointer (`src/session-pointer.ts`): run the
+cache-flow matrix in `tests/CACHE-FLOWS.md` — layers 1 and 2 before calling the change done,
+layer 3 (live) before pushing it — and add a row for any new flow that keeps or drops a CC
+session. Run the live layer on Haiku only.
+
 ## Changelog
 
 Maintain an entry in the `## UNRELEASED` section at the top of `CHANGELOG.md` for every significant change, using the existing format:

@@ -50,9 +50,10 @@ try {
  * @param {Object} opts.env - Extra env vars to set on the pi process
  * @param {string} opts.cwd - Working directory for the pi process (default: project root)
  * @param {number} opts.defaultTimeout - Default timeout for send/wait operations (default: 30000)
+ * @param {string} opts.sessionFile - Persist to this pi session file instead of --no-session
  */
 export function createRpcHarness(opts) {
-	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000 } = opts;
+	const { name, args = [], env = {}, cwd = DIR, defaultTimeout = 30_000, sessionFile } = opts;
 
 	const LOGDIR = process.env.CLAUDE_BRIDGE_TEST_LOG_DIR ?? `${DIR}/.test-output`;
 	mkdirSync(LOGDIR, { recursive: true });
@@ -77,7 +78,7 @@ export function createRpcHarness(opts) {
 		startedOnce = true;
 		stopped = false;
 		rpcLog = createWriteStream(RPC_LOG, { flags: "a" });
-		const spawnArgs = ["--no-session", "-ne", "-e", DIR, "--mode", "rpc", ...args];
+		const spawnArgs = [...(sessionFile ? ["--session", sessionFile] : ["--no-session"]), "-ne", "-e", DIR, "--mode", "rpc", ...args];
 		pi = spawn("pi", spawnArgs, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
