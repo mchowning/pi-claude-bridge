@@ -62,6 +62,8 @@ Do not add changelog entries for docs-only changes. If multiple entries in the U
 
 Tags: `Add`, `Fix`, `Refactor`, `Tests`, `Bump`, `Deprecate`, `Remove`.
 
+**This is a fork:** write entries for this fork's changes in `CHANGELOG.fork.md`, not `CHANGELOG.md`. `CHANGELOG.md` mirrors upstream (`origin`) so merges don't conflict on it; never edit it here.
+
 ## Release
 
 No build step — the package ships `src` TypeScript as-is (see `files` in `package.json`). To cut version `X.Y.Z`:
