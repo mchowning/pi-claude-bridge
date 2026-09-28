@@ -244,6 +244,29 @@ async function prepareForkFrom(sourceSessionId: string, cwd: string): Promise<st
 	return sessionId;
 }
 
+// /reload re-evaluates this module, and the new instance would start with no session and
+// rebuild, rewriting main's whole history to the prompt cache (and leaving a thread fork
+// nothing to start from). The Claude Code session file still matches pi's history, so the
+// reloading instance leaves its session here and the next one takes it. Keyed by pi's
+// session file: isolated subagents also re-evaluate this module in-process, but they start
+// with reason "startup" and another session, so they never adopt the parent's.
+const RELOAD_HANDOFF_KEY = Symbol.for("pi-claude-bridge.reload-handoff");
+type ReloadHandoff = { sessionFile: string; session: SessionState };
+
+function leaveReloadHandoff(sessionFile: string | undefined): void {
+	const g = globalThis as Record<symbol, unknown>;
+	g[RELOAD_HANDOFF_KEY] = sessionFile && sharedSession ? { sessionFile, session: sharedSession } satisfies ReloadHandoff : undefined;
+}
+
+function adoptReloadHandoff(sessionFile: string | undefined): void {
+	const g = globalThis as Record<symbol, unknown>;
+	const handoff = g[RELOAD_HANDOFF_KEY] as ReloadHandoff | undefined;
+	g[RELOAD_HANDOFF_KEY] = undefined;
+	if (!handoff || !sessionFile || handoff.sessionFile !== sessionFile) return;
+	sharedSession = handoff.session;
+	debug(`session_start:reload: adopted session ${handoff.session.sessionId.slice(0, 8)} cursor=${handoff.session.cursor}`);
+}
+
 // Published for the process that spawns forks: which Claude Code session this process
 // resumes, and how many pi messages it covers. Read-only; null before the first turn and
 // while the session is due for a rebuild, when its file no longer matches pi's history.
@@ -2141,6 +2164,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
+		if (event.reason === "reload") adoptReloadHandoff(ctx.sessionManager.getSessionFile());
 	});
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
@@ -2205,8 +2229,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("turn_start", (_event, ctx) => {
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event, ctx) => {
 		reportLeaks("session_shutdown");
+		if (event.reason === "reload") leaveReloadHandoff(ctx.sessionManager.getSessionFile());
 		clearSession("session_shutdown");
 	});
 
