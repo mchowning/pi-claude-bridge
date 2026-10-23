@@ -1,15 +1,16 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { buildSessionContext, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
+import { POINTER_TYPE, adoptablePointer, type SessionPointer } from "./session-pointer.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -330,6 +331,116 @@ markRebuildHooks.add(markRebuildForSession);
 function sponsorMarkRebuildForSession(piSession: string | null, event: string): void {
 	for (const hook of markRebuildHooks) hook(piSession, event);
 }
+
+// A process started with CLAUDE_BRIDGE_FORK_FROM answers from a copy of another
+// process's Claude Code session. The copy is made before the first query (forkSession
+// is async; syncSharedSession is not) and adopted by the first sync, which then takes
+// the REUSE path: the copy holds exactly the source's prefix, so the fork's first turn
+// reads it from the prompt cache instead of rewriting it. The parent only sets the
+// variable when the source's cursor equals the history it copied into the fork. Held for
+// the pi session that prepared it, so another session in this process never adopts it,
+// and for the cwd it was copied under, since CC resolves the copy under that cwd's project.
+let pendingFork: { piSessionId: string | null; sessionId: string; cwd: string } | null = null;
+
+async function prepareForkFrom(sourceSessionId: string, cwd: string, piSessionId: string | null): Promise<string> {
+	const { sessionId } = await forkSession(sourceSessionId, { dir: cwd });
+	pendingFork = { piSessionId, sessionId, cwd };
+	debug(`fork-from: copied session ${sourceSessionId.slice(0, 8)} → ${sessionId.slice(0, 8)}`);
+	return sessionId;
+}
+
+// /reload re-evaluates this module, and the new instance would start with no session and
+// rebuild, rewriting main's whole history to the prompt cache (and leaving a thread fork
+// nothing to start from). The Claude Code session file still matches pi's history, so the
+// reloading instance leaves its session here and the next one takes it. Keyed by pi's
+// session file: isolated subagents also re-evaluate this module in-process, but they start
+// with reason "startup" and another session, so they never adopt the parent's.
+const RELOAD_HANDOFF_KEY = Symbol.for("pi-claude-bridge.reload-handoff");
+type ReloadHandoff = { sessionFile: string; session: SessionState };
+
+function leaveReloadHandoff(sessionFile: string | undefined, piSessionId: string): void {
+	const g = globalThis as Record<symbol, unknown>;
+	const session = sessionStateFor(piSessionId);
+	g[RELOAD_HANDOFF_KEY] = sessionFile && session ? { sessionFile, session } satisfies ReloadHandoff : undefined;
+}
+
+function adoptReloadHandoff(sessionFile: string | undefined, piSessionId: string): void {
+	const g = globalThis as Record<symbol, unknown>;
+	const handoff = g[RELOAD_HANDOFF_KEY] as ReloadHandoff | undefined;
+	g[RELOAD_HANDOFF_KEY] = undefined;
+	if (!handoff || !sessionFile || handoff.sessionFile !== sessionFile) return;
+	setSessionStateFor(piSessionId, handoff.session);
+	debug(`session_start:reload: adopted session ${handoff.session.sessionId.slice(0, 8)} cursor=${handoff.session.cursor}`);
+}
+
+// The session pointer (src/session-pointer.ts). A context_edit changes content without an
+// event and without changing the message count, so REUSE cannot see it; the pointer written
+// after such a run would certify a CC session that never saw the edit. agent_end therefore
+// scans the branch for edits since the later of the last pointer and the last rebuild (which
+// imported pi's edited history). pi's leaf is recorded at turn_start, since the provider has
+// no session manager, and copied to rebuiltAt when that turn's sync rebuilds.
+const leafAtTurnStart = new Map<string, string | null>();
+const rebuiltAt = new Map<string, string | null>();
+
+type PointerSessionManager = {
+	getSessionId(): string;
+	getEntries(): readonly { type: string; id: string }[];
+	getBranch(): readonly { type: string; id: string; customType?: string }[];
+	buildSessionProjection(): { messages: readonly { role: string }[] };
+};
+
+/** On startup or resume, resume the CC session the session's last good run recorded. */
+function adoptPointer(sm: PointerSessionManager, reason: string): void {
+	const piSessionId = sm.getSessionId();
+	const cwd = process.cwd();
+	const decision = adoptablePointer(
+		{
+			entries: sm.getEntries(),
+			branch: sm.getBranch(),
+			contextRoles: sm.buildSessionProjection().messages.map((m) => m.role).filter((role) => role !== "system"),
+		},
+		{ piSessionId, cwd, ccFileExists: (id) => existsSync(getSessionPath(id, cwd, process.env.CLAUDE_CONFIG_DIR)) },
+	);
+	if (!decision.pointer) {
+		debug(`session_start:${reason}: no pointer adopted (${decision.reason})`);
+		return;
+	}
+	const { ccSessionId, cursor } = decision.pointer;
+	setSessionStateFor(piSessionId, { sessionId: ccSessionId, cursor, cwd, piSessionId });
+	debug(`session_start:${reason}: adopted pointer ${ccSessionId.slice(0, 8)} cursor=${cursor}`);
+}
+
+/** The pointer for this pi session's finished run, or null when the run is not one to certify. */
+function pointerAfterRun(sm: PointerSessionManager, messages: readonly { role: string; provider?: string; stopReason?: string }[]): SessionPointer | null {
+	const piSessionId = sm.getSessionId();
+	const state = sessionStateFor(piSessionId);
+	if (!state || state.needsRebuild || state.forceRotate) return null;
+	const last = messages.filter((m) => m.role === "assistant").at(-1);
+	if (last?.provider !== PROVIDER_ID || (last.stopReason !== "stop" && last.stopReason !== "length")) return null;
+	const branch = sm.getBranch();
+	const since = Math.max(
+		branch.reduce((found, e, i) => (e.type === "custom" && e.customType === POINTER_TYPE ? i : found), -1),
+		branch.findIndex((e) => e.id === rebuiltAt.get(sessionKey(piSessionId))),
+	);
+	if (branch.slice(since + 1).some((e) => e.type === "context_edit")) {
+		setSessionStateFor(piSessionId, { ...state, needsRebuild: true });
+		debug(`agent_end: a context_edit may not have reached CC session ${state.sessionId.slice(0, 8)}; marked for rebuild, no pointer`);
+		return null;
+	}
+	return { piSessionId, ccSessionId: state.sessionId, cursor: state.cursor, cwd: state.cwd };
+}
+
+// Published for the process that spawns forks: given a pi session id, which Claude Code
+// session that pi session resumes, and how many pi messages it covers. Null before the
+// session's first turn and while it is due for a rebuild, when its file no longer matches
+// pi's history.
+Object.defineProperty(globalThis, Symbol.for("pi-claude-bridge.session"), {
+	configurable: true,
+	value: (piSessionId: string): { sessionId: string; cursor: number } | null => {
+		const session = sessionStateFor(piSessionId);
+		return session && !session.needsRebuild ? { sessionId: session.sessionId, cursor: session.cursor } : null;
+	},
+});
 
 // Convert pi messages to Anthropic API format for session import.
 // Lossy: only text, thinking and toolCall blocks survive, and thinking only when
@@ -770,6 +881,14 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	const history = nonSystemMessages(messages);
 	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
+	if (!sharedSession && pendingFork && pendingFork.piSessionId === (piSessionId ?? null) && pendingFork.cwd === cwd) {
+		const { sessionId } = pendingFork;
+		pendingFork = null;
+		setSessionStateFor(piSessionId, { sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+		debug(`syncResult: path=fork-from sessionId=${sessionId} cursor=${priorMessages.length}`);
+		return { sessionId };
+	}
+
 	// REUSE path
 	//
 	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
@@ -777,7 +896,10 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	// A CC session lives under its cwd's project dir, so a mirror from another cwd is
+	// neither resumed nor preserved: it falls through to REBUILD.
+	const sameCwd = sharedSession?.cwd === cwd;
+	if (sharedSession && sameCwd && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -808,7 +930,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// Only reachable when needsRebuild is false — user-facing history rewrites
 	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
 	// sharedSession before the next syncSharedSession call.
-	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
+	if (sharedSession && sameCwd && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
 		return { sessionId: null, preserveSharedSession: true };
@@ -818,6 +940,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	if (priorMessages.length === 0) {
 		debug(`Case 1: clean start, ${history.length} total messages`);
 		debug(`syncResult: path=clean-start`);
+		rebuiltAt.set(sessionKey(piSessionId), leafAtTurnStart.get(sessionKey(piSessionId)) ?? null);
 		return { sessionId: null };
 	}
 	const previousSessionId = sharedSession?.sessionId;
@@ -845,6 +968,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	// carrying an `@file` expansion across a rebuild writes into the same file.
 	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 	setSessionStateFor(piSessionId, { sessionId: session.sessionId, cursor: priorMessages.length, cwd, piSessionId: piSessionId ?? undefined });
+	rebuiltAt.set(sessionKey(piSessionId), leafAtTurnStart.get(sessionKey(piSessionId)) ?? null);
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -866,10 +990,13 @@ export const __test = {
 	setQuery(fn: typeof query | null) {
 		queryImpl = fn ?? query;
 	},
+	prepareForkFrom,
 	resetSharedSession(piSessionId?: string | null) {
 		// No id: full reset (the pre-map semantics — tests start from a blank slate).
-		if (piSessionId === undefined) sharedSessions.clear();
-		else setSessionStateFor(piSessionId, null);
+		if (piSessionId === undefined) {
+			sharedSessions.clear();
+			pendingFork = null;
+		} else setSessionStateFor(piSessionId, null);
 		historyRewrittenBySession.clear();
 	},
 	markRebuildForSession,
@@ -2513,6 +2640,12 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
+		if (event.reason === "reload") adoptReloadHandoff(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionId());
+		// A fresh thread fork starts from CLAUDE_BRIDGE_FORK_FROM; the runner never sets it on a
+		// reopened fork, which adopts its own pointer like any restarted session.
+		if ((event.reason === "startup" || event.reason === "resume") && ctx.sessionManager && !process.env.CLAUDE_BRIDGE_FORK_FROM) {
+			adoptPointer(ctx.sessionManager, event.reason);
+		}
 	});
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
@@ -2528,6 +2661,9 @@ export default function (pi: ExtensionAPI) {
 	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
 	// at before_agent_start so the agent_start recording below can reuse them.
 	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
+	// Once per process: a failed copy falls back to a normal rebuild rather than
+	// retrying on every turn.
+	let forkPrepared = false;
 	let lastSystemPromptOptions: RecordOptions | undefined;
 	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
 		customPrompt?: string;
@@ -2547,7 +2683,15 @@ export default function (pi: ExtensionAPI) {
 			sections: options?.sections,
 		}, source);
 	}
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
+		const forkFrom = process.env.CLAUDE_BRIDGE_FORK_FROM;
+		if (forkFrom && !forkPrepared) {
+			const piSessionId = ctx.sessionManager.getSessionId();
+			if (!sessionStateFor(piSessionId)) {
+				forkPrepared = true;
+				await prepareForkFrom(forkFrom, process.cwd(), piSessionId);
+			}
+		}
 		lastSystemPromptOptions = event.systemPromptOptions;
 		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
 	});
@@ -2575,11 +2719,20 @@ export default function (pi: ExtensionAPI) {
 	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
 	// next before_agent_start — accepted: a stale skills list beats failing the turn.
 	pi.on("turn_start", (_event, ctx) => {
+		if (ctx.sessionManager) leafAtTurnStart.set(sessionKey(ctx.sessionManager.getSessionId()), ctx.sessionManager.getLeafId());
 		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("agent_end", (event, ctx) => {
+		if (!ctx.sessionManager) return;
+		const pointer = pointerAfterRun(ctx.sessionManager, event.messages as { role: string; provider?: string; stopReason?: string }[]);
+		if (!pointer) return;
+		pi.appendEntry(POINTER_TYPE, pointer);
+		debug(`agent_end: wrote pointer ${pointer.ccSessionId.slice(0, 8)} cursor=${pointer.cursor}`);
+	});
+	pi.on("session_shutdown", (event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
 		reportLeaks("session_shutdown");
+		if (event.reason === "reload") leaveReloadHandoff(ctx.sessionManager.getSessionFile(), ctx.sessionManager.getSessionId());
 		clearSession("session_shutdown");
 	});
 
