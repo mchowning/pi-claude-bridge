@@ -69,7 +69,7 @@ async function flow(name, { cwd } = {}) {
 	let dir = work;
 	const logs = [];
 	const make = () => {
-		const harness = createRpcHarness({ name: `cache-flows-${API}-${name}-${logs.length}`, sessionFile, cwd: dir, env, args: ["--model", MODEL, "-e", EXT], defaultTimeout: 120_000 });
+		const harness = createRpcHarness({ name: `cache-flows-${API}-${name}-${logs.length}`, persistSession: true, cwd: dir, env, args: ["--session", sessionFile, "--model", MODEL, "-e", EXT], defaultTimeout: 120_000 });
 		logs.push(harness.DEBUG_LOG);
 		return harness;
 	};
@@ -112,7 +112,7 @@ async function flow(name, { cwd } = {}) {
 		observe(mark) {
 			const lines = log().slice(mark.log);
 			const sync = lines.find((l) => l.includes("syncResult: path="));
-			const adopted = lines.find((l) => /adopted (pointer|session)/.test(l)) ?? null;
+			const adopted = lines.find((l) => /fork-from: adopted/.test(l)) ?? null;
 			const result = {
 				path: sync?.match(/path=(\S+)/)?.[1] ?? null,
 				ccSession: sync?.match(/sessionId=([0-9a-f-]{36})/)?.[1] ?? null,
@@ -152,7 +152,9 @@ const ROWS = {
 		const m = f.mark(); const before = f.ccSessionBefore(m);
 		await f.restart(); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path reuse": o.path === "reuse", "same CC session": o.ccSession === before, "cache hit": hit(o.cache) } };
+		// A loaded state is dirtyTail (CC may have appended past it before exit), so the
+		// first turn forks at the last cut into a new id, keeping the whole prefix.
+		return { o, checks: { "path fork": o.path === "fork", "new CC session": o.ccSession !== before, "cache hit": hit(o.cache) } };
 	} },
 	4: { name: "multi-turn-with-tools", async run(f) {
 		await f.prompt(P.plain(1)); await f.prompt(P.tool);
@@ -174,7 +176,7 @@ const ROWS = {
 		const m = f.mark(); const before = f.ccSessionBefore(m);
 		await f.restart(); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path reuse": o.path === "reuse", "same CC session": o.ccSession === before }, measured: ["cache"] };
+		return { o, checks: { "path fork": o.path === "fork", "new CC session": o.ccSession !== before }, measured: ["cache"] };
 	} },
 	10: { name: "compact-then-restart", async run(f) {
 		// Fake replies are a few tokens; pad the prompts so older turns exceed keepRecentTokens.
@@ -194,7 +196,9 @@ const ROWS = {
 		const m = f.mark();
 		await f.restart(); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path rebuild": o.path === "rebuild" || o.path === "clean-start", "no adoption": !o.adopted } };
+		// pi keeps the aborted turn's own history, which CC never recorded: keep CC's
+		// prefix up to it and write the rest.
+		return { o, checks: { "path prefix-write": o.path === "prefix-write" } };
 	} },
 	12: { name: "rewind-label-then-restart", async run(f) {
 		await f.prompt(P.plain(1)); await f.prompt(P.plain(2));
@@ -202,7 +206,8 @@ const ROWS = {
 		const m = f.mark();
 		await f.restart(); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path rebuild": o.path === "rebuild" || o.path === "clean-start", "no adoption": !o.adopted } };
+		// The rewind drops the last turn: fork at the cut before it.
+		return { o, checks: { "path fork": o.path === "fork" } };
 	} },
 	13: { name: "other-provider-then-restart", async run(f) {
 		await f.prompt(P.plain(1));
@@ -212,7 +217,8 @@ const ROWS = {
 		const m = f.mark();
 		await f.restart(); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path rebuild": o.path === "rebuild" || o.path === "clean-start", "no adoption": !o.adopted } };
+		// The other provider's turn is not in CC's file: keep the bridge's prefix, write the rest.
+		return { o, checks: { "path prefix-write": o.path === "prefix-write", "cache hit": hit(o.cache) } };
 	} },
 	14: { name: "pi-fork-first-turn", async run(f) {
 		await f.prompt(P.plain(1)); await f.prompt(P.plain(2));
@@ -226,13 +232,16 @@ const ROWS = {
 		const unchanged = mainBytes !== null && readFileSync(mainFile, "utf8") === mainBytes;
 		return { o, checks: { "path rebuild or clean-start": o.path === "rebuild" || o.path === "clean-start", "not main's CC session": o.ccSession !== main, "main's CC file unchanged": unchanged } };
 	} },
-	15: { name: "restart-in-another-cwd", async run(f) {
+	15: { name: "restart-from-another-dir", async run(f) {
+		// pi --session restores the session's recorded cwd, so the turn (and CC) stay in the
+		// original cwd and the session forks as after any restart. A real cwd change is
+		// pinned by tests/unit-sync-cwd.mjs.
 		await f.prompt(P.plain(1)); await f.prompt(P.plain(2));
 		const m = f.mark();
 		const other = join(f.root, "elsewhere"); mkdirSync(other, { recursive: true });
 		await f.restart({ cwd: other }); await f.prompt(P.plain(3));
 		const o = f.observe(m);
-		return { o, checks: { "path rebuild": o.path === "rebuild" || o.path === "clean-start", "no adoption": !o.adopted } };
+		return { o, checks: { "path fork": o.path === "fork", "cache hit": hit(o.cache) } };
 	} },
 	16: { name: "context-edit-then-recovery", async run(f) {
 		await f.prompt(P.plain(1));
@@ -245,8 +254,8 @@ const ROWS = {
 		await f.restart(); await f.prompt(P.plain(5));
 		const o2 = f.observe(m2);
 		return { o: { afterEdit: o1, afterRecovery: o2 }, checks: {
-			"after the edit: rebuild": o1.path === "rebuild" || o1.path === "clean-start",
-			"after recovery: reuse": o2.path === "reuse", "after recovery: same CC session": o2.ccSession === before, "after recovery: cache hit": hit(o2.cache),
+			"after the edit: prefix-write": o1.path === "prefix-write",
+			"after recovery: fork": o2.path === "fork", "after recovery: new CC session": o2.ccSession !== before, "after recovery: cache hit": hit(o2.cache),
 		} };
 	} },
 	17: { name: "cc-file-deleted-then-restart", async run(f) {

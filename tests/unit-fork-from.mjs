@@ -1,126 +1,86 @@
 /**
- * A process started with CLAUDE_BRIDGE_FORK_FROM begins from a forkSession copy of
- * another process's Claude Code session, and every process publishes its own session
- * on a global so a parent can decide whether a fork can reuse it.
+ * A process started with CLAUDE_BRIDGE_FORK_FROM (a plannotator review thread) starts
+ * from the saved state of the pi session that owns that Claude Code session, so its first
+ * turn forks main's CC session at the last cut and reads main's history from the prompt
+ * cache. Every process publishes its sessions on a global so the thread runner can decide
+ * whether a fork can start from main's session.
  */
-import { describe, it, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createSession, deleteSession, openSession } from "cc-session-io";
+import { createSession } from "cc-session-io";
+import { stateFor } from "./lib/session-state.mjs";
+import { saveSessionState } from "../src/session-store.js";
 
 const { __test } = await import("../src/index.js");
 const SESSION_KEY = Symbol.for("pi-claude-bridge.session");
-const PI = "pi-main";
+const MAIN = "pi-main";
+const FORK = "pi-thread";
+const user = (content) => ({ role: "user", content, timestamp: 1 });
+const say = (text) => ({ role: "assistant", content: [{ type: "text", text }], provider: "claude-bridge", timestamp: 1 });
+const history = [user("Read the plan."), say("Friday ship date.")];
+
+let cwd;
+beforeEach(() => {
+	cwd = mkdtempSync(join(tmpdir(), "fork-from-"));
+	__test.resetSharedSession();
+});
+afterEach(() => {
+	__test.resetSharedSession();
+	rmSync(cwd, { recursive: true, force: true });
+});
+
+/** Main's CC session on disk and its saved state, as after a finished main turn. */
+function seedMain() {
+	const session = createSession({ projectPath: cwd, model: "sonnet" });
+	const state = stateFor(session, history, "sonnet");
+	session.save();
+	saveSessionState(MAIN, state);
+	return { session, state };
+}
 
 describe("published session", () => {
-	afterEach(() => __test.resetSharedSession());
-
-	it("reports a pi session's Claude Code session id and cursor, or null before its first turn", () => {
-		assert.equal(globalThis[SESSION_KEY](PI), null);
-		__test.setSharedSession(PI, { sessionId: "abc", cursor: 4, cwd: "/tmp" });
-		assert.deepEqual(globalThis[SESSION_KEY](PI), { sessionId: "abc", cursor: 4 });
+	it("reports a pi session's Claude Code session id and how many pi messages it covers, or null", () => {
+		assert.equal(globalThis[SESSION_KEY](MAIN), null);
+		const { state } = seedMain();
+		__test.setSharedSession(MAIN, state);
+		assert.deepEqual(globalThis[SESSION_KEY](MAIN), { sessionId: state.ccSessionId, cursor: 2 });
 		assert.equal(globalThis[SESSION_KEY]("pi-other"), null, "another pi session has none");
 	});
 
-	it("reports null while the session is due for a rebuild, since its file no longer matches pi", () => {
-		__test.setSharedSession(PI, { sessionId: "abc", cursor: 4, cwd: "/tmp", needsRebuild: true });
-		assert.equal(globalThis[SESSION_KEY](PI), null);
+	it("reads a restarted main's saved state", () => {
+		const { state } = seedMain();
+		assert.deepEqual(globalThis[SESSION_KEY](MAIN), { sessionId: state.ccSessionId, cursor: 2 });
 	});
 });
 
 describe("fork from another session", () => {
-	afterEach(() => __test.resetSharedSession());
+	it("forks main's CC session at its last cut on the first turn and leaves main's file alone", () => {
+		const { session } = seedMain();
+		const mainBytes = readFileSync(session.jsonlPath, "utf8");
 
-	it("resumes a copy of the source session on the first turn and leaves the source alone", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "fork-from-"));
-		const source = createSession({ projectPath: cwd });
-		source.importMessages([
-			{ role: "user", content: "Read the plan." },
-			{ role: "assistant", content: [{ type: "text", text: "Friday ship date." }] },
-		]);
-		source.save();
-		const sourceBytes = readFileSync(source.jsonlPath, "utf8");
-		let forkedId;
-		try {
-			forkedId = await __test.prepareForkFrom(source.sessionId, cwd, PI);
-			assert.notEqual(forkedId, source.sessionId);
+		assert.equal(__test.adoptForkFrom(session.sessionId, FORK), true);
+		const result = __test.syncSharedSession([...history, user("You are answering a review comment.")], cwd, undefined, "sonnet", FORK);
 
-			const result = __test.syncSharedSession([
-				{ role: "user", content: "Read the plan.", timestamp: Date.now() },
-				{ role: "assistant", content: [{ type: "text", text: "Friday ship date." }], timestamp: Date.now() },
-				{ role: "user", content: "You are answering a review comment.", timestamp: Date.now() },
-			], cwd, undefined, undefined, PI);
-
-			assert.equal(result.sessionId, forkedId, "the first turn resumes the copy, not a rebuild");
-			assert.deepEqual(__test.getSharedSession(PI), { sessionId: forkedId, cursor: 2, cwd, piSessionId: PI });
-			assert.equal(readFileSync(source.jsonlPath, "utf8"), sourceBytes, "the source session is untouched");
-			const copy = openSession({ sessionId: forkedId, projectPath: cwd });
-			assert.deepEqual(
-				copy.messages.map((m) => m.type),
-				["user", "assistant"],
-				"the copy carries the source's history",
-			);
-		} finally {
-			deleteSession(source.sessionId, cwd);
-			if (forkedId) deleteSession(forkedId, cwd);
-			rmSync(cwd, { recursive: true, force: true });
-		}
+		assert.equal(result.sessionId, session.sessionId, "resumes main's session");
+		assert.ok(result.forkAt, "as a fork at a cut, not a plain resume that would append to main's file");
+		assert.notEqual(result.targetSessionId, session.sessionId);
+		assert.equal(readFileSync(session.jsonlPath, "utf8"), mainBytes);
+		assert.equal(__test.getSharedSession(MAIN).ccSessionId, session.sessionId, "main keeps its own session");
 	});
 
-	it("leaves the copy for the pi session that prepared it; another session in the process does not take it", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "fork-from-owner-"));
-		const source = createSession({ projectPath: cwd });
-		source.importMessages([
-			{ role: "user", content: "Hi" },
-			{ role: "assistant", content: [{ type: "text", text: "Hello." }] },
-		]);
-		source.save();
-		let forkedId;
-		const history = [
-			{ role: "user", content: "Hi", timestamp: Date.now() },
-			{ role: "assistant", content: [{ type: "text", text: "Hello." }], timestamp: Date.now() },
-			{ role: "user", content: "Next", timestamp: Date.now() },
-		];
-		try {
-			forkedId = await __test.prepareForkFrom(source.sessionId, cwd, PI);
-			const child = __test.syncSharedSession(history, cwd, undefined, undefined, "pi-subagent");
-			assert.notEqual(child.sessionId, forkedId, "a subagent's first turn does not take the fork copy");
-			const owner = __test.syncSharedSession(history, cwd, undefined, undefined, PI);
-			assert.equal(owner.sessionId, forkedId, "the preparing session still gets it");
-		} finally {
-			deleteSession(source.sessionId, cwd);
-			if (forkedId) deleteSession(forkedId, cwd);
-			rmSync(cwd, { recursive: true, force: true });
-		}
+	it("does nothing when the fork already has state (a reopened thread)", () => {
+		const { session, state } = seedMain();
+		__test.setSharedSession(FORK, { ...state, ccSessionId: "thread-own" });
+		assert.equal(__test.adoptForkFrom(session.sessionId, FORK), false);
+		assert.equal(__test.getSharedSession(FORK).ccSessionId, "thread-own");
 	});
 
-	it("adopts the copy only once; later turns follow the normal sync rules", async () => {
-		const cwd = mkdtempSync(join(tmpdir(), "fork-from-once-"));
-		const source = createSession({ projectPath: cwd });
-		source.importMessages([
-			{ role: "user", content: "Hi" },
-			{ role: "assistant", content: [{ type: "text", text: "Hello." }] },
-		]);
-		source.save();
-		let forkedId;
-		try {
-			forkedId = await __test.prepareForkFrom(source.sessionId, cwd, PI);
-			__test.syncSharedSession([
-				{ role: "user", content: "Hi", timestamp: Date.now() },
-				{ role: "assistant", content: [{ type: "text", text: "Hello." }], timestamp: Date.now() },
-				{ role: "user", content: "Next", timestamp: Date.now() },
-			], cwd, undefined, undefined, PI);
-			__test.resetSharedSession(PI);
-			const second = __test.syncSharedSession([
-				{ role: "user", content: "Only one", timestamp: Date.now() },
-			], cwd, undefined, undefined, PI);
-			assert.equal(second.sessionId, null, "no pending fork is left to adopt");
-		} finally {
-			deleteSession(source.sessionId, cwd);
-			if (forkedId) deleteSession(forkedId, cwd);
-			rmSync(cwd, { recursive: true, force: true });
-		}
+	it("does nothing when no saved state names the source session", () => {
+		seedMain();
+		assert.equal(__test.adoptForkFrom("no-such-session", FORK), false);
+		assert.equal(__test.getSharedSession(FORK), null);
 	});
 });

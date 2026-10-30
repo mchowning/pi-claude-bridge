@@ -2,8 +2,7 @@
 
 Flows where the bridge must keep a pi session on the same Claude Code session (so the prompt
 cache hits) and flows where it must rebuild (so the model never sees a history that differs
-from pi's). Run it on any change to session sync, fork-from, reload/restart handoff or the
-session pointer, and add a row for any new flow of that kind.
+from pi's). Run it on any change to session sync, persisted session state or fork-from, and add a row for any new flow of that kind.
 
 A hit row that starts missing is a cost regression. A rebuild row that starts resuming is a
 correctness bug, which matters more. A rebuild row may still read tools and CC's system
@@ -11,28 +10,31 @@ prompt from cache; only the path and the CC session are asserted there.
 
 ## Rows
 
-"Path" is the first `syncResult: path=` after the event in the bridge debug log. "Unit" names
-the tests that pin the row's decision without a model.
+"Path" is the first `syncResult: path=` after the event in the bridge debug log (upstream's
+#222 rows: `reuse` = row 4, `fork` = row 6, `prefix-write` = row 7, `rebuild`/`clean-start` =
+rows 1-3 and 5). A restart loads persisted state with `dirtyTail` set, so its first turn
+forks at the last cut into a new CC id rather than resuming in place; the whole prefix is
+kept and read from cache. "Unit" names the tests that pin the row's decision without a model.
 
 | # | Flow | Path | CC session | Cache | Unit |
 |---|---|---|---|---|---|
-| 1 | Restart (same session file), then a main turn | reuse | main's, same id | hit | `unit-session-pointer-wiring` (adopts on startup/resume), `unit-session-pointer` |
-| 2 | Restart, then a review thread before any main turn | fork-from | new id, copy of main's | hit; no runner warning | `unit-session-pointer-wiring` (adoption publishes the lookup), `unit-fork-from` |
-| 3 | Fork process reopened without `CLAUDE_BRIDGE_FORK_FROM` (retry, second review) | reuse | the fork's own | hit | `unit-session-pointer-wiring` (adopts on startup) |
+| 1 | Restart (same session file), then a main turn | fork | new id, main's whole prefix | hit | `unit-session-store` (loaded state is dirtyTail), `unit-session-prefix` (row 6 fork) |
+| 2 | Restart, then a review thread before any main turn | fork | new id, from main's saved state | hit; no runner warning | `unit-fork-from` (reads a restarted main's saved state) |
+| 3 | Fork process reopened without `CLAUDE_BRIDGE_FORK_FROM` (retry, second review) | fork | new id, from the fork's own saved state | hit | `unit-fork-from` (a thread with state keeps it) |
 | 4 | Multi-turn with tool calls | reuse | same | hit | `unit-sync-shared-session` |
-| 5 | `/reload`, then a main turn | reuse | same | hit | `unit-reload-handoff` |
-| 6 | `/reload`, then a thread | fork-from | new id | hit | `unit-reload-handoff`, `unit-fork-from` |
-| 7 | Thread after a main turn | fork-from | new id | hit | `unit-fork-from` |
-| 8 | Second turn in a fork; two threads at once | reuse (fork); fork-from ×2 | each fork its own | hit | `unit-fork-from` (the copy stays with the session that prepared it) |
-| 9 | Tool-set change (a second `system` entry), then restart | reuse | same | measured: the tools block changes, so a partial read is expected | `unit-sync-shared-session` (system messages and the cursor), `unit-session-pointer` (a system entry is harmless) |
-| 10 | `/compact`, restart | rebuild | — | not asserted | `unit-session-pointer` (compaction rejects) |
-| 11 | Abort mid-turn, restart | rebuild | — | not asserted | `unit-session-pointer-wiring` (no pointer after an abort), `unit-session-pointer` |
-| 12 | `/tree` rewind (no summary) + label, restart | rebuild | — | not asserted | `unit-session-pointer` (abandoned branch; turn on another branch) |
-| 13 | Turns on another provider, back to the bridge, restart | rebuild | — | not asserted | `unit-session-pointer-wiring` (another provider answered), `unit-session-pointer` |
-| 14 | pi `/fork` of main, first turn | rebuild or clean-start | never main's id; main's CC file byte-identical | not asserted | `unit-session-pointer` (another pi session's pointer), `unit-fork-from` |
-| 15 | Restart in another cwd | rebuild | — | not asserted | `unit-sync-cwd`, `unit-session-pointer` (cwd) |
-| 16 | `context_edit` during a run, restart, then a good run and restart | rebuild, then reuse | —, then same | hit on the last | `unit-session-pointer-wiring` (context_edit tests) |
-| 17 | Restart after the CC session file is deleted | rebuild | — | not asserted | `unit-session-pointer` (CC file gone) |
+| 5 | `/reload`, then a main turn | reuse | same | hit | — |
+| 6 | `/reload`, then a thread | fork | new id | hit | `unit-fork-from` |
+| 7 | Thread after a main turn | fork | new id; main's file untouched | hit | `unit-fork-from` |
+| 8 | Second turn in a fork; two threads at once | reuse (fork); fork ×2 | each fork its own | hit | `unit-fork-from` |
+| 9 | Tool-set change (a second `system` entry), then restart | fork | new id | measured: the tools block changes, so a partial read is expected | `unit-sync-shared-session` (system entries are ignored) |
+| 10 | `/compact`, restart | rebuild | new id | not asserted | — |
+| 11 | Abort mid-turn, restart | prefix-write | new id, CC's prefix up to the aborted turn | not asserted | `unit-query-lifecycle` (abort), `unit-session-prefix` (row 7) |
+| 12 | `/tree` rewind (no summary) + label, restart | fork | new id, cut before the dropped turn | not asserted | `unit-session-prefix` (row 6 fork) |
+| 13 | Turns on another provider, back to the bridge, restart | prefix-write | new id, bridge prefix kept | hit | `unit-session-prefix` (row 7) |
+| 14 | pi `/fork` of main, first turn | rebuild or clean-start | never main's id; main's CC file byte-identical | not asserted | — |
+| 15 | Restart from another dir (`pi --session` restores the session's cwd) | fork | new id, in the session's cwd | hit | `unit-sync-shared-session` ("cwd changes never resume…") |
+| 16 | `context_edit` during a run, restart, then a good run and restart | prefix-write, then fork | new id at the edit, then new id with the whole prefix | hit on the last | `unit-message-digests`, `unit-session-prefix` (row 7) |
+| 17 | Restart after the CC session file is deleted | rebuild | new id | not asserted | `unit-sync-shared-session` ("missing files import…") |
 
 ## Layers
 

@@ -16,8 +16,8 @@ Five wrong conclusions across two sessions came from skipping the above.
 
 ## Cache-flow matrix
 
-Any change to session sync (`syncSharedSession`, the completion capture, rebuild marks),
-fork-from, the `/reload` handoff or the session pointer (`src/session-pointer.ts`): run the
+Any change to session sync (`syncSharedSession`, `src/session-sync.ts`, the recording
+commit), persisted session state (`src/session-store.ts`) or fork-from (`adoptForkFrom`): run the
 cache-flow matrix in `tests/CACHE-FLOWS.md` — layers 1 and 2 before calling the change done,
 layer 3 (live) before pushing it — and add a row for any new flow that keeps or drops a CC
 session. Run the live layer on Haiku only.
@@ -30,9 +30,11 @@ Maintain an entry in the `## UNRELEASED` section at the top of `CHANGELOG.md` fo
 - **Tag: summary** — detail
 ```
 
-Do not add changelog entries for docs-only changes. Combine multiple UNRELEASED entries about the same feature into one.
+Do not add changelog entries for docs-only changes, or for small changes (especially test-only ones) unless they relate to an issue. Combine multiple UNRELEASED entries about the same feature into one.
 
-Tags: `Add`, `Fix`, `Refactor`, `Tests`, `Bump`, `Deprecate`, `Remove`.
+Keep entries short: one sentence of detail is usually enough. Only a big change warrants a few sentences. Leave implementation details and file lists to the commit log and docs.
+
+Tags: `Add`, `Fix`, `Refactor`, `Tests`, `Bump`, `Deprecate`, `Remove`, `Debug`.
 
 **This is a fork:** write entries for this fork's changes in `CHANGELOG.fork.md`, not `CHANGELOG.md`. `CHANGELOG.md` mirrors upstream (`origin`) so merges don't conflict on it; never edit it here.
 
@@ -50,3 +52,5 @@ No build step — the package ships `src` TypeScript as-is (see `files` in `pack
 ## Tests
 
 Smoke tests typically need to run outside a sandbox because they access local pi/Claude settings and auth state.
+
+Cover inputs the model chooses (tool names, message shapes), not just our own branches. A test of a copy of the code is not coverage.
