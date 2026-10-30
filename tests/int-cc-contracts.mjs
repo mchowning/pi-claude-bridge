@@ -966,3 +966,46 @@ test("includeGitInstructions:false strips gitStatus and keeps the preset static 
 		rmSync(repo, { recursive: true, force: true });
 	}
 });
+
+// --- Resuming a session that ends at a tool result ---
+
+test("CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS=1 stops CC resuming a turn that ends at a tool result", { timeout: 120_000 }, async () => {
+	// A rebuild after a terminating tool, or after a parked query was discarded, ends
+	// at a tool result, which CC reads as an interrupted turn. Behind a server flag it
+	// then inserts a meta "Continue from where you left off." user message ahead of our
+	// prompt; CLAUDE_CODE_RESUME_INTERRUPTED_TURN forces that path here, so the control
+	// doesn't depend on the flag. src/index.ts CC_CHILD_ENV sets the bound. (PR #145)
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-resume-contract-"));
+	const resumePrompt = "Continue from where you left off.";
+	const sessionIds = [];
+	const run = async (extraEnv) => {
+		const session = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: MODEL });
+		sessionIds.push(session.sessionId);
+		session.importMessages([
+			{ role: "user", content: "Compact now." },
+			{ role: "assistant", content: [{ type: "tool_use", id: "toolu_compact_1", name: "mcp__custom-tools__compact", input: {} }] },
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_compact_1", content: "Compaction scheduled." }] },
+		]);
+		session.save();
+		await collect(query({
+			prompt: "PI-RESUME-NOTE",
+			options: providerOptions({
+				cwd, resume: session.sessionId, maxTurns: 1,
+				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1", ...extraEnv },
+			}),
+		}));
+		const body = requests.filter((b) => JSON.stringify(b.messages).includes("PI-RESUME-NOTE")).at(-1);
+		assert.ok(body, "the resumed query never reached the stub API");
+		return JSON.stringify(body.messages);
+	};
+	try {
+		assert.ok((await run({})).includes(resumePrompt), "CC no longer inserts its resume prompt when forced; this guard may be obsolete");
+		assert.ok(!(await run({ CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1" })).includes(resumePrompt), "CC still inserted its resume prompt with the bound set");
+	} finally {
+		api.close();
+		for (const id of sessionIds) deleteSession(id, cwd, process.env.CLAUDE_CONFIG_DIR);
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});

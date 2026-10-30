@@ -59,11 +59,17 @@ const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 // - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: no update checks, MCP registry or
 //   telemetry. Set here, not on pi's process.env, so it doesn't leak into every
 //   command pi runs.
+// - CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS=1: a resumed session that ends at
+//   a tool result (after a terminating tool, or a discarded parked query) reads to CC
+//   as an interrupted turn, and behind a server flag CC inserts a "Continue from where
+//   you left off." user message ahead of pi's prompt. pi supplies every prompt, so
+//   every turn counts as too old to resume.
 const CC_CHILD_ENV = {
 	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 	DISABLE_AUTO_COMPACT: "1",
 	CLAUDE_CODE_ELEGANT_MEADOW: "0",
 	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+	CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1",
 } as const;
 
 // Set by Claude Code on its own child processes (eXe(), its session-env list and
