@@ -168,6 +168,19 @@ it("another session survives a history rewrite", { timeout: 5000 }, async () => 
 	assert.deepEqual(readFileSync(sibling.path), before);
 });
 
+it("another session's copy of a tool result never enters this session's waiting query", { timeout: 5000 }, async () => {
+	const ask = user("read");
+	scripts.push({ tool: true });
+	const tool = await call([ask]).result();
+	const [parked] = __test.activeQueryContexts;
+	scripts.push({});
+	assert.equal((await call([ask, tool, toolResult], undefined, "fork").result()).stopReason, "stop");
+	assert.equal(calls.length, 2, "the fork runs its own query");
+	assert.equal(calls[0].child.killed, false);
+	assert.equal(parked.discarded, false);
+	assert.equal(parked.pendingResults.size, 0);
+});
+
 it("continuation digest failures report provider errors instead of throwing", { timeout: 5000 }, async () => {
 	const ask = user("read");
 	scripts.push({ tool: true });
@@ -300,6 +313,17 @@ it("a fresh same-session query discards a parked query and retains its progress 
 	assert.deepEqual(__test.getSharedSession("pi").digests, digestMessages([ask, tool]));
 	await next.result();
 	assert.equal(__test.getSharedSession("pi").ccSessionId, calls[1].options.resume);
+});
+
+it("session_shutdown closes its own parked query (a terminate:true tool's) and leaves other sessions' alone", { timeout: 5000 }, async () => {
+	scripts.push({ tool: true }, { tool: true, toolId: "OTHER" });
+	await call([user("tool")]).result();
+	await call([user("tool")], undefined, "other").result();
+	const [mine, other] = calls;
+	for (const fn of handlers.session_shutdown) fn({}, { sessionManager: { getSessionId: () => "pi" } });
+	await mine.exited;
+	assert.equal(other.child.killed, false);
+	assert.deepEqual([...__test.activeQueryContexts].map((c) => c.piSessionId), ["other"]);
 });
 
 

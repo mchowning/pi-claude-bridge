@@ -17,9 +17,12 @@ Pi extension that integrates Claude Code via the [Agent SDK](https://github.com/
 
 ## Install
 
-```
-pi install npm:pi-claude-bridge
-```
+1. Install the extension:
+   ```
+   pi install npm:pi-claude-bridge
+   ```
+2. Log in to Claude Code with your Claude subscription: run `claude` and type `/login`. The bridge uses Claude Code's login, not pi's `/login`.
+3. In pi, pick a `claude-bridge/...` model with `/model`. (Do not use the `anthropic/...` models)
 
 Requires pi 1.2.0 or newer to use all models (but should mostly work >=0.86.1).
 

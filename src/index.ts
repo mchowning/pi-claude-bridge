@@ -1012,33 +1012,39 @@ const promptCaptures = sharedPromptCaptures((diagnostic) => {
 	);
 });
 
-/** Whatever a settled session left behind, named in one greppable line. Scoped to
- *  that session: subagents run in the parent's process and shut down while the
- *  parent's query is still live.
+/** Close every query a shutting-down pi session still holds, keeping its progress
+ *  for a later resume. Scoped to that session: subagents run in the parent's
+ *  process and shut down while the parent's query is still live.
  *
- *  Every one of these should be empty once the last turn ends, and each is a leak
- *  that costs something real: a retained context routes a later orphaned tool result
- *  into the delivery path and returns a stream nobody ends; a pending tool call is an
- *  MCP handler Claude Code is still waiting on; a live prompt stream is an unresolved
- *  ack. The activeQueryContexts leak was present on every single happy-path run and
- *  no test noticed, because nothing asserted that anything ends clean — so assert it
- *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
-function reportLeaks(label: string, piSessionId: string): void {
-	const contexts = [...activeQueryContexts].filter((c) => c.piSessionId === piSessionId);
-	const pendingCalls = contexts.reduce((n, c) => n + c.pendingToolCalls.size, 0);
-	const liveStreams = contexts.filter((c) => c.promptStream !== null).length;
-	if (contexts.length === 0) return;
-	debug(
-		`WARNING: ${label} left state behind — contexts=${contexts.length} `
-		+ `pendingToolCalls=${pendingCalls} promptStreams=${liveStreams}`,
-	);
+ *  A live query here is expected: a tool that returns `terminate: true` ends pi's
+ *  run with Claude Code still parked on its result, and that child would keep the
+ *  process alive after pi is done (issue #210). A context with no query is a leak
+ *  that costs something real: it routes a later orphaned tool result into the
+ *  delivery path and returns a stream nobody ends. That leak was present on every
+ *  single happy-path run and no test noticed, because nothing asserted that
+ *  anything ends clean — so assert it where the real sessions are, and let
+ *  diag/audit-warnings.mjs scan for it. */
+function closeSessionQueries(piSessionId: string): void {
+	for (const c of [...activeQueryContexts]) {
+		if (c.piSessionId !== piSessionId) continue;
+		debug(
+			`${c.activeQuery ? "session_shutdown: closing parked query" : "WARNING: session_shutdown left a context with no query"} — `
+			+ `pendingToolCalls=${c.pendingToolCalls.size} promptStream=${c.promptStream !== null}`,
+		);
+		discardRewrittenQuery(c);
+	}
 }
 
-function contextForToolResults(results: McpResult[]): QueryContext | undefined {
+/** The parked query of this pi session that these results answer. Tool-call ids
+ *  repeat across sessions whenever one copies another's history (a fork, a worker
+ *  seeded from its host), so an id alone could deliver one session's turn into
+ *  another's Claude Code query. */
+function contextForToolResults(results: McpResult[], piSessionId: string | null): QueryContext | undefined {
 	for (const result of results) {
 		const id = result.toolCallId;
 		if (!id) continue;
 		for (const queryCtx of activeQueryContexts) {
+			if (queryCtx.piSessionId !== piSessionId) continue;
 			if (queryCtx.pendingToolCalls.has(id) || queryCtx.pendingResults.has(id) || queryCtx.turnToolCallIds.includes(id)) {
 				return queryCtx;
 			}
@@ -1656,7 +1662,10 @@ async function consumeQuery(
 				queryCtx.lastRateLimitWarnThreshold = undefined;
 				// resetsAt is Unix seconds, not milliseconds.
 				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
-				piUI?.notify(`Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+				// isUsingOverage: the plan limit is hit but Extra Usage is serving (and billing) requests.
+				piUI?.notify(info.isUsingOverage
+					? `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — requests are now billed to Extra Usage until ${resetsAt}`
+					: `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
 			} else if (info?.status === "allowed") {
 				// Back under the threshold (window reset) — re-arm the warning dedupe.
 				queryCtx.lastRateLimitWarnStep = null;
@@ -1918,7 +1927,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	let activeQuery = activeQueryContexts.size > 0;
 	const allResults = activeQueryContexts.size > 0 ? extractAllToolResults(context) : [];
-	let resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
+	let resultCtx = allResults.length > 0 ? contextForToolResults(allResults, options?.sessionId ?? null) : undefined;
 
 	// pi rewrote its history while this query sat parked at a tool boundary, so the
 	// query answers about a conversation that no longer exists. Discard it and let
@@ -2725,7 +2734,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
-		reportLeaks("session_shutdown", ctx.sessionManager.getSessionId());
+		closeSessionQueries(ctx.sessionManager.getSessionId());
 		clearSession("session_shutdown");
 	});
 
