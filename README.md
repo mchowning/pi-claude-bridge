@@ -39,7 +39,7 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 ## Configuration
 
-Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global).
+Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global). `provider` settings are read only from the global file, so a cloned repo can't point the bridge at its own executable or turn on metered billing.
 
 ```json
 {
@@ -117,7 +117,7 @@ To add instructions, use `message`, `context`, or a system-message edit that kee
 
 ### Hooks written for Claude Code
 
-`~/.claude/settings.json` hooks fire inside bridge turns, so a hook injecting Claude-specific guidance duplicates what pi's extensions already provide. pi sets `PI_CODING_AGENT=true` for child processes, including the Claude Code child; a hook can skip itself on that:
+`~/.claude/settings.json` hooks fire inside bridge turns, so a hook injecting Claude-specific guidance duplicates what pi's extensions already provide. A project's `.claude/settings.json` and `.claude/settings.local.json` are not loaded, so a repo's hooks, `apiKeyHelper` and `env` never run. pi sets `PI_CODING_AGENT=true` for child processes, including the Claude Code child; a hook can skip itself on that:
 
 ```sh
 [ -n "$PI_CODING_AGENT" ] && exit 0

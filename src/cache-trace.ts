@@ -21,6 +21,7 @@
 // Serialization errors are programming errors and always throw.
 
 import type { Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { getSessionPath, normalizeProjectPath } from "cc-session-io";
@@ -68,7 +69,7 @@ export function resetTraceForTests(): void {
 	delete (globalThis as Record<symbol, unknown>)[RUN_KEY];
 }
 
-function packageVersion(name: string): string | null {
+export function packageVersion(name: string): string | null {
 	try {
 		const require = createRequire(import.meta.url);
 		let dir = dirname(require.resolve(name));
@@ -79,7 +80,7 @@ function packageVersion(name: string): string | null {
 	}
 }
 
-function bridgeRevision(): { version: string | null; revision: string | null; dirty: string | null } {
+export function bridgeRevision(): { version: string | null; revision: string | null; dirty: string | null } {
 	const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 	const version = JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version ?? null;
 	try {
@@ -117,7 +118,7 @@ function startRun(root: string): TraceRun {
 		node: process.version,
 		bridge: bridgeRevision(),
 		sdk: packageVersion("@anthropic-ai/claude-agent-sdk"),
-		pi: packageVersion("@earendil-works/pi-coding-agent"),
+		pi: PI_VERSION,
 		recording: r.raw ? "raw" : "shape",
 		// A base URL can itself change what Claude Code sends: traced and untraced
 		// runs are comparable only with that in mind.

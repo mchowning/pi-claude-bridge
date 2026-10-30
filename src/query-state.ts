@@ -95,6 +95,9 @@ export class QueryContext {
 	turnStreamOpen = false;
 	/** turnBlocks length at that message_start: where an abandoned attempt's blocks begin. */
 	turnStreamBlockStart = 0;
+	/** API message id of the non-streaming fallback being delivered from `assistant`
+	 *  messages. The SDK hands it over one block per message, all under this id. */
+	turnFallbackMessageId: string | undefined;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -129,6 +132,7 @@ export class QueryContext {
 		this.turnStreamMessageId = undefined;
 		this.turnStreamOpen = false;
 		this.turnStreamBlockStart = 0;
+		this.turnFallbackMessageId = undefined;
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.

@@ -2,7 +2,7 @@
 // generated launch flags must be ones the native CLI accepts.
 import { it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +17,14 @@ const model = provider.models.find((m) => m.id.includes("haiku")) ?? provider.mo
 const user = (content) => ({ role: "user", content, timestamp: 1 });
 const say = (text) => ({ role: "assistant", content: [{ type: "text", text }], provider: model.provider, timestamp: 1 });
 const cwd = mkdtempSync(join(tmpdir(), "native-launch-"));
+// A cloned repo's Claude Code settings must not run anything in bridge queries.
+const repoHookRan = join(cwd, "repo-hook-ran");
+mkdirSync(join(cwd, ".claude"));
+for (const file of ["settings.json", "settings.local.json"]) {
+	writeFileSync(join(cwd, ".claude", file), JSON.stringify({
+		hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: `touch '${repoHookRan}'` }] }] },
+	}));
+}
 const requests = [], launches = [], env = {};
 const server = createServer(async (request, response) => {
 	const chunks = [];
@@ -89,4 +97,5 @@ it("native Claude Code accepts import, restart fork, prefix-write and AskClaude 
 	assert.equal(launches[3].sessionId, undefined, "AskClaude's import resumes its written id");
 	assert.ok(launches[3].resume);
 	assert.equal(__test.getSharedSession("pi-ask"), null);
+	assert.equal(existsSync(repoHookRan), false, "a hook from the repo's .claude settings ran");
 });

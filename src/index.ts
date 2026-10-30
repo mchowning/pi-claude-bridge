@@ -1,6 +1,6 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, isToolCallEventType, keyHint, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, isToolCallEventType, keyHint, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
@@ -36,7 +36,7 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
-import { setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
+import { bridgeRevision, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -973,7 +973,9 @@ const promptCaptures = sharedPromptCaptures((diagnostic) => {
 	);
 });
 
-/** Whatever a settled session left behind, named in one greppable line.
+/** Whatever a settled session left behind, named in one greppable line. Scoped to
+ *  that session: subagents run in the parent's process and shut down while the
+ *  parent's query is still live.
  *
  *  Every one of these should be empty once the last turn ends, and each is a leak
  *  that costs something real: a retained context routes a later orphaned tool result
@@ -982,12 +984,13 @@ const promptCaptures = sharedPromptCaptures((diagnostic) => {
  *  ack. The activeQueryContexts leak was present on every single happy-path run and
  *  no test noticed, because nothing asserted that anything ends clean — so assert it
  *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
-function reportLeaks(label: string): void {
-	const pendingCalls = [...activeQueryContexts].reduce((n, c) => n + c.pendingToolCalls.size, 0);
-	const liveStreams = [...activeQueryContexts].filter((c) => c.promptStream !== null).length;
-	if (activeQueryContexts.size === 0 && pendingCalls === 0 && liveStreams === 0) return;
+function reportLeaks(label: string, piSessionId: string): void {
+	const contexts = [...activeQueryContexts].filter((c) => c.piSessionId === piSessionId);
+	const pendingCalls = contexts.reduce((n, c) => n + c.pendingToolCalls.size, 0);
+	const liveStreams = contexts.filter((c) => c.promptStream !== null).length;
+	if (contexts.length === 0) return;
 	debug(
-		`WARNING: ${label} left state behind — contexts=${activeQueryContexts.size} `
+		`WARNING: ${label} left state behind — contexts=${contexts.length} `
 		+ `pendingToolCalls=${pendingCalls} promptStreams=${liveStreams}`,
 	);
 }
@@ -1424,11 +1427,11 @@ function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
 //
 // It is also the content path when a stream stalls: Claude Code drops it and asks
 // again without streaming ("Error streaming, falling back to non-streaming mode"),
-// and the answer arrives as one assistant message, under a new message id, with no
-// stream_events of its own. turnSawStreamEvent is already set by the dead stream,
-// so gating on it alone dropped that message: its tool calls never reached pi, CC
-// sat in the MCP handler waiting for their results, and the turn hung on "Working"
-// until the user aborted it.
+// and the answer arrives one assistant message per content block, all under a new
+// message id, with no stream_events of its own. turnSawStreamEvent is already set
+// by the dead stream, so gating on it alone dropped that message: its tool calls
+// never reached pi, CC sat in the MCP handler waiting for their results, and the
+// turn hung on "Working" until the user aborted it.
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
@@ -1452,17 +1455,21 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
 		return;
 	}
-	if (c.turnSawStreamEvent) {
+	const id = assistantMsg.id;
+	if (c.turnSawStreamEvent && (!id || id !== c.turnFallbackMessageId)) {
 		// Same id was already delivered; a new id is CC's non-streaming fallback.
 		// Drop the stalled stream's partial blocks if it never stopped. Deliberately
 		// deliver even if it stopped, at the risk of duplication if CC renumbers it.
-		const id = assistantMsg.id;
 		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) return;
 		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `non-streaming fallback ${id}`);
+		c.turnFallbackMessageId = id;
 	}
-	c.turnStreamMessageId = assistantMsg.id;
-	if (assistantMsg.id && !c.turnAssistantIds.includes(assistantMsg.id)) c.turnAssistantIds.push(assistantMsg.id);
-	c.turnToolCallIds = [];
+	// Later blocks of the same id continue the message rather than starting it over.
+	if (id !== c.turnStreamMessageId) {
+		c.turnStreamMessageId = id;
+		if (id && !c.turnAssistantIds.includes(id)) c.turnAssistantIds.push(id);
+		c.turnToolCallIds = [];
+	}
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
@@ -2088,8 +2095,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 		// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 		// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
-		// programmatically and ignore filesystem MCP entries — applied unconditionally because
-		// settingSources is left at CC's default, which loads all sources.
+		// programmatically and ignore filesystem MCP entries.
 		const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 		const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -2103,7 +2109,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 		// Suppress claude.ai cloud MCP servers (Figma/Canva/etc. auto-discovered via OAuth
 		// when the user is logged into Anthropic). These are a separate code path from
-		// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources=undefined.
+		// filesystem MCP and are NOT blocked by --strict-mcp-config or settingSources.
 		// The native CC binary gates them on env var ENABLE_CLAUDEAI_MCP_SERVERS: setting it
 		// to "0"/"false"/"no"/"off" makes the loader return early before any cloud fetch.
 		// DISABLE_AUTO_COMPACT=1: pi owns context-management and propagates its own
@@ -2124,6 +2130,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			tools: [],
 			permissionMode: "bypassPermissions",
 			includePartialMessages: true,
+			// User settings only. A repo's .claude/settings.json and settings.local.json can
+			// carry hooks, apiKeyHelper, env and plugins, and Claude Code trusts the workspace
+			// when it isn't interactive, so they would run with no prompt. ~/.claude/settings.json
+			// still loads: Bedrock/Vertex users keep env and apiKeyHelper there.
+			settingSources: ["user"] as SettingSource[],
 			// includeGitInstructions:false drops the gitStatus block from the preset.
 			// That block is the trailing suffix of the cached system block, and a
 			// git-state transition (new file, staging, commit) rewrites it — busting
@@ -2431,7 +2442,8 @@ async function promptAndWait(
 			// without the tool and permission guidance the bridge relies on everywhere else.
 			// Whether pi has skills to append is unrelated to whether the child needs that.
 			systemPrompt: { type: "preset", preset: "claude_code", append: skillsBlock },
-			settingSources: ["user", "project"] as SettingSource[],
+			// User settings only, as on the provider path.
+			settingSources: ["user"] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(sync.forkAt ? { forkSession: true, resumeSessionAt: sync.forkAt } : {}),
@@ -2557,6 +2569,8 @@ export default function (pi: ExtensionAPI) {
 
 	const config = loadConfig(process.cwd());
 	let askClaudeDeprecationNoticeShown = Boolean(config.askClaudeDeprecationShown);
+	const rev = bridgeRevision();
+	debug(`bridge: version=${rev.version} commit=${rev.revision?.slice(0, 8)} dirty=${Boolean(rev.dirty)} sdk=${packageVersion("@anthropic-ai/claude-agent-sdk")} pi=${PI_VERSION}`);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
@@ -2675,7 +2689,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
 		forgetSessionCwd(ctx.sessionManager.getSessionId());
-		reportLeaks("session_shutdown");
+		reportLeaks("session_shutdown", ctx.sessionManager.getSessionId());
 		clearSession("session_shutdown");
 	});
 
