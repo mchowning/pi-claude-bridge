@@ -81,6 +81,25 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 
 **Extension providers and models.json:** pi's `modelOverrides` in `~/.pi/agent/models.json` do not work correctly with pi-claude-bridge; they only apply to pi-side settings like compaction threshold. Overriding `contextWindow` or other fields requires editing `src/models.ts` directly — to pin a model to 200K, use `provider.forceTwoHundredK` instead.
 
+**Claude Code's environment:** Claude Code inherits pi's environment. For variables only bridge requests should get (a proxy, a gateway, Bedrock settings), add an `env` object to a `claude-bridge` credential in `~/.pi/agent/auth.json`; its values override pi's, and an empty value removes the variable. Extensions calling a bridge model can pass `env` per request the same way. `CLAUDE_CONFIG_DIR`, `HOME` and `USERPROFILE` can't be set there (the turn fails), since the bridge reads Claude Code's session files through pi's own values.
+
+This example sends bridge requests through a proxy and keeps an exported gateway (issue #107) away from Claude Code, so it uses your Claude login:
+
+```json
+{
+  "claude-bridge": {
+    "type": "api_key",
+    "key": "not-used",
+    "env": {
+      "HTTPS_PROXY": "http://127.0.0.1:8080",
+      "ANTHROPIC_BASE_URL": "",
+      "ANTHROPIC_API_KEY": "",
+      "ANTHROPIC_AUTH_TOKEN": ""
+    }
+  }
+}
+```
+
 ## Tests
 
 `npm run test:unit` for offline tests. `npm test` adds integration tests that hit APIs; set `CLAUDE_BRIDGE_TESTING_ALT_MODEL` in `.env.test` for the alt-provider smoke test.
@@ -159,4 +178,4 @@ Session pointers, content digests and record IDs are saved under `claude-bridge/
 
 **System prompt changes mid-session may not reach the model.** Project context (AGENTS.md/CLAUDE.md), skills, and extension-written instructions are captured on the first request and reused while that prompt recording is retained. Start a new session if updated instructions must take effect immediately.
 
-**Exported Anthropic environment variables override the Claude Code child (issue #107).** An exported `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` redirects Claude Code to that gateway and every turn fails with its auth error. Unset them for the pi process.
+**Exported Anthropic environment variables override the Claude Code child (issue #107).** An exported `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, or `ANTHROPIC_AUTH_TOKEN` redirects Claude Code to that gateway and every turn fails with its auth error. Unset them for the pi process, or blank them in a `claude-bridge` credential's `env` (see [Configuration](#configuration)).

@@ -65,7 +65,7 @@ after(async () => {
 });
 
 async function turn(messages) {
-	const output = await provider.streamSimple(model, { messages, tools: [] }, { sessionId: "pi-native" }).result();
+	const output = await provider.streamSimple(model, { messages, tools: [] }, { sessionId: "pi-native", env: { PROVIDER_ENV_PROBE: "1" } }).result();
 	assert.equal(output.stopReason, "stop", output.errorMessage);
 	assert.deepEqual(output.content.filter((b) => b.type === "text").map((b) => b.text), ["ACK"]);
 	return output;
@@ -74,6 +74,7 @@ async function turn(messages) {
 it("native Claude Code accepts import, restart fork, prefix-write and AskClaude import launches", { timeout: 120_000 }, async () => {
 	const prior = [user("first question"), say("first answer")];
 	const second = await turn([...prior, user("second")]);
+	assert.equal(launches[0].env.PROVIDER_ENV_PROBE, "1", "pi's provider env reaches Claude Code");
 	assert.equal(launches[0].sessionId, undefined, "row 2 resumes its written import");
 	assert.ok(launches[0].resume);
 	assert.match(requests.at(-1), /first answer/);

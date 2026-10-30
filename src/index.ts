@@ -56,11 +56,49 @@ const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
 //   into its session file (`api-request`, `api-request-shape`, `api-request-blob`
 //   records). CC never reads them back to build a request; they only make the
 //   file about a third larger.
+// - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1: no update checks, MCP registry or
+//   telemetry. Set here, not on pi's process.env, so it doesn't leak into every
+//   command pi runs.
 const CC_CHILD_ENV = {
 	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 	DISABLE_AUTO_COMPACT: "1",
 	CLAUDE_CODE_ELEGANT_MEADOW: "0",
+	CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
 } as const;
+
+// Set by Claude Code on its own child processes (eXe(), its session-env list and
+// hook env in 2.1.308), or exported by that parent. When pi runs inside a Claude Code
+// session they describe that session, not ours: the SDK stamps its own entrypoint and
+// version only when they're unset, and CC's Bash tool runs CLAUDE_ENV_FILE's script.
+// AI_AGENT is left alone: pi overwrites it with "pi" at startup.
+const PARENT_SESSION_VARS = [
+	"CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED",
+	"CLAUDE_PID", "CLAUDE_EFFORT", "TRACEPARENT", "CLAUDE_CODE_INVOKED_SKILLS", "CLAUDE_ENV_FILE",
+	"CLAUDE_CODE_ENTRYPOINT", "CLAUDE_AGENT_SDK_VERSION", "CLAUDE_CODE_EXECPATH",
+	"CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+];
+
+// The bridge reads and writes Claude Code's session files through pi's own values of
+// these, so a child pointed elsewhere would resume a session the bridge never wrote.
+const SESSION_STORAGE_VARS = ["CLAUDE_CONFIG_DIR", "HOME", "USERPROFILE"];
+
+// Environment for every Claude Code subprocess. Config (ANTHROPIC_*, CLAUDE_CONFIG_DIR,
+// CLAUDE_CODE_USE_BEDROCK, ...) always passes through; parent-session markers are
+// dropped only when CLAUDECODE says pi was started from inside Claude Code. `overrides`
+// is pi's per-request provider env (a stored credential's `env`, or the caller's), which
+// takes precedence over process.env; an empty value removes the variable, since pi's
+// auth.json only allows strings. CC_CHILD_ENV goes last so its guards always hold.
+function ccChildEnv(overrides: Record<string, string> = {}, parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const storage = Object.keys(overrides).filter((name) => SESSION_STORAGE_VARS.includes(name.toUpperCase()));
+	if (storage.length) throw new Error(`claude-bridge: provider env can't set ${storage.join(", ")}; the bridge reads Claude Code's session files through pi's own values`);
+	const env: NodeJS.ProcessEnv = { ...parent };
+	if (parent.CLAUDECODE) for (const name of PARENT_SESSION_VARS) delete env[name];
+	for (const [name, value] of Object.entries(overrides)) {
+		if (value === "") delete env[name];
+		else env[name] = value;
+	}
+	return { ...env, ...CC_CHILD_ENV };
+}
 
 // Pi owns context files on the provider path, so Claude Code must not load its
 // own on top: otherwise project CLAUDE.md/AGENTS.md files arrive twice, and
@@ -555,7 +593,7 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, { ...process.env, ...CC_CHILD_ENV }),
+				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, ccChildEnv(options?.env)),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -858,6 +896,7 @@ export const __test = {
 	deliverToolResults,
 	drainForAbort,
 	CC_CHILD_ENV,
+	ccChildEnv,
 	buildMcpServers,
 	get promptCaptures() {
 		return promptCaptures;
@@ -2121,7 +2160,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			kind: "provider", callId: traceCallId, piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			model: cliModel, effort: effort ?? null, servedToolNames: Object.fromEntries(customToolNameToSdk), mcpTools: mcpTools.map((t) => t.name),
 			signal: traceSignalId(options?.signal), digests: { systemPromptAppend },
-		}, { ...process.env, ...CC_CHILD_ENV });
+		}, ccChildEnv(options?.env));
 		const cliDebug = makeCliDebugOptions("provider");
 		const childProcess = new QueryProcess(cliDebug.stderr);
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
@@ -2432,7 +2471,7 @@ async function promptAndWait(
 		prompt,
 		options: {
 			cwd,
-			env: traceQueryStart(traceQueryId, { kind: "askclaude", piSessionId: askClaudeSessionId, resume: resumeSessionId, model: cliModel, mode, isolated: Boolean(options?.isolated) }, { ...process.env, ...CC_CHILD_ENV }),
+			env: traceQueryStart(traceQueryId, { kind: "askclaude", piSessionId: askClaudeSessionId, resume: resumeSessionId, model: cliModel, mode, isolated: Boolean(options?.isolated) }, ccChildEnv()),
 			permissionMode: "bypassPermissions",
 			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
 			skills: [],
@@ -2564,9 +2603,6 @@ const PREVIEW_MAX_LINES = 6;
 let askClaudeToolName = "AskClaude";
 
 export default function (pi: ExtensionAPI) {
-	// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
-	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-
 	const config = loadConfig(process.cwd());
 	let askClaudeDeprecationNoticeShown = Boolean(config.askClaudeDeprecationShown);
 	const rev = bridgeRevision();
