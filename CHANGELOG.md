@@ -2,7 +2,9 @@
 
 ## UNRELEASED
 
-- **Fix: keep Claude Code history that still matches pi's (#222)** — The bridge now compares message content instead of counting messages, so it catches edits and keeps everything up to the first difference. Rewinds, edits, interruptions and restarts fork or trim the Claude Code session instead of rebuilding it, preserving prompt cache and thinking. Fixes #30, #42, #62, #86, #103, #165, #182, #202, #203; helps #55, #77, #114, #207. Builds on PR #136; thanks @sonSunnoi.
+- **Fix: bash default timeout broke the prompt cache on rebuild (#203)** — The 120s default now applies when the command runs instead of being saved in pi's history, so rebuilt sessions match Claude Code's. Thanks @cad0p and @superninjv.
+- **Fix: active history edits** — Restart Claude Code from pi's selected history before delivering tool results, even without a rewrite event. Thanks @rochecompaan.
+- **Fix: keep Claude Code history that still matches pi's (#222)** — The bridge now compares message content instead of counting messages, so it catches edits and keeps everything up to the first difference. Rewinds, edits, interruptions and restarts fork or trim the Claude Code session instead of rebuilding it, preserving prompt cache and thinking. Fixes #30, #42, #62, #86, #103, #165, #182, #202; helps #55, #77, #114, #207. Builds on PR #136; thanks @sonSunnoi.
 - **Bump: Claude Agent SDK 0.3.308 (Claude Code 2.1.308)** — Claude Code's new per-request log in session files is turned off; it made them about a third larger.
 - **Fix: queued steering keeps MCP input open through later turns (#172)** — Keep Claude Code's input open until each steer is replayed into a turn, then close after that turn completes. An error result still ends the query, so a steer Claude Code had queued can no longer run on and replace the failure. Thanks @Maverobot.
 - **Debug: opt-in cache trace** — `CLAUDE_BRIDGE_TRACE_DIR` logs session decisions to help diagnose prompt-cache loss. See `diag/CACHE-TRACE.md`.

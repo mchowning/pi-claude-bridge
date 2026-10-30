@@ -76,7 +76,9 @@ function fakeQuery({ options, prompt }) {
 		await ready;
 		const input = typeof prompt === "string" ? null : prompt[Symbol.asyncIterator]();
 		const initial = input ? (await input.next()).value : { message: { content: prompt } };
-		if (input) void input.next().catch(() => {});
+		if (input) void (async () => {
+			for await (const _ of input) { /* Drain stdin like the SDK transport. */ }
+		})().catch(() => {});
 		entry.pulled = true;
 		// CC pulled the prompt from stdin, then dies booting: no record, no replay.
 		if (script.boot) { await parked; return; }
@@ -84,7 +86,7 @@ function fakeQuery({ options, prompt }) {
 		if (!script.preInit) yield { type: "system", subtype: "init", session_id: id };
 		if (!script.preInit && input) yield { type: "user", isReplay: true, parent_tool_use_id: null, uuid: initial.uuid, session_id: id, message: initial.message };
 		if (script.tool) {
-			const value = record("assistant", [{ type: "tool_use", id: "X", name: "mcp__custom-tools__read", input: {} }], undefined, script.deferTool);
+			const value = record("assistant", [{ type: "tool_use", id: script.toolId ?? "X", name: "mcp__custom-tools__read", input: {} }], undefined, script.deferTool);
 			yield { type: "assistant", parent_tool_use_id: null, uuid: value.uuid, message: { id: "tool-api", model: model.id, content: value.message.content } };
 			await parked;
 			if (stopped) return;
@@ -104,6 +106,79 @@ afterEach(async () => {
 	for (const call of calls) if (call.child.exitCode === null && call.child.signalCode === null) call.child.kill("SIGKILL");
 	await Promise.all(calls.map((c) => c.exited));
 	await tick();
+});
+
+for (const { name, prior, selected, expected } of [
+	{ name: "a same-length edit", prior: [user("SECRET_BEFORE_REWRITE")],
+		selected: [user("SELECTED_AFTER_REWRITE")], expected: "SELECTED_AFTER_REWRITE" },
+	{ name: "shortened history", prior: [user("SECRET_BEFORE_REWRITE"), say("prior answer"), user("read")],
+		selected: [user("read")], expected: "read" },
+]) it(`${name} replaces the waiting query without a rewrite event`, { timeout: 5000 }, async () => {
+	scripts.push({ tool: true });
+	const tool = await call(prior).result();
+	const ancestor = readFileSync(calls[0].path);
+	scripts.push({});
+	const next = call([...selected, tool, toolResult]);
+	assert.equal(calls[0].child.killed, true, "the stale writer must stop");
+	assert.equal((await next.result()).stopReason, "stop");
+	assert.equal(calls.length, 2);
+	assert.notEqual(calls[1].path, calls[0].path);
+	assert.deepEqual(readFileSync(calls[0].path), ancestor);
+	const records = readFileSync(calls[1].path, "utf8").trim().split("\n").map(JSON.parse);
+	const blocks = records.flatMap((r) => Array.isArray(r.message?.content) ? r.message.content : []);
+	assert.ok(records.some((r) => r.message?.content === expected)
+		|| blocks.some((b) => b.type === "text" && b.text === expected));
+	assert.doesNotMatch(JSON.stringify(records), /SECRET_BEFORE_REWRITE/);
+	assert.equal(blocks.filter((b) => b.type === "tool_result" && b.tool_use_id === "X").length, 1);
+});
+
+for (const steering of [false, true]) it(`unchanged history reuses its waiting query${steering ? " with steering" : ""}`, { timeout: 5000 }, async () => {
+	const ask = user("read");
+	scripts.push({ tool: true });
+	const tool = await call([ask]).result();
+	const [parked] = __test.activeQueryContexts;
+	call([ask, tool, toolResult, ...(steering ? [user("steer")] : [])]);
+	await tick();
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].child.killed, false);
+	assert.equal(parked.discarded, false);
+	assert.ok(__test.activeQueryContexts.has(parked));
+	assert.equal(parked.pendingResults.get("X").content[0].text, "file");
+});
+
+it("another session survives a history rewrite", { timeout: 5000 }, async () => {
+	scripts.push({ tool: true });
+	const tool = await call([user("SECRET_BEFORE_REWRITE")]).result();
+	const siblingAsk = user("sibling");
+	scripts.push({});
+	const siblingAnswer = await call([siblingAsk], undefined, "other").result();
+	const saved = __test.getSharedSession("other");
+	scripts.push({ tool: true, toolId: "OTHER" });
+	await call([siblingAsk, siblingAnswer, user("read")], undefined, "other").result();
+	const sibling = calls.at(-1);
+	const parked = [...__test.activeQueryContexts].find((c) => c.piSessionId === "other");
+	const before = readFileSync(sibling.path);
+	scripts.push({});
+	assert.equal((await call([user("SELECTED_AFTER_REWRITE"), tool, toolResult]).result()).stopReason, "stop");
+	assert.equal(calls.length, 4);
+	assert.ok(__test.activeQueryContexts.has(parked));
+	assert.equal(parked.discarded, false);
+	assert.equal(sibling.child.killed, false);
+	assert.strictEqual(__test.getSharedSession("other"), saved);
+	assert.deepEqual(readFileSync(sibling.path), before);
+});
+
+it("continuation digest failures report provider errors instead of throwing", { timeout: 5000 }, async () => {
+	const ask = user("read");
+	scripts.push({ tool: true });
+	const tool = await call([ask]).result();
+	const invalid = { ...tool, content: [{ type: "toolCall", id: "X", name: "read", arguments: { value: NaN } }] };
+	let next;
+	assert.doesNotThrow(() => { next = call([ask, invalid, toolResult]); });
+	const output = await next.result();
+	assert.equal(output.stopReason, "error");
+	assert.match(output.errorMessage, /JSON|finite/);
+	assert.equal(calls.length, 1);
 });
 
 it("quota retries delete each new file only after the child finishes its late writes", async () => {

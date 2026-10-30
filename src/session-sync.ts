@@ -143,6 +143,16 @@ export class LiveRecording {
 		this.nextIndex = this.recorded.digests.length;
 		for (const message of messages.slice(0, this.nextIndex)) updatePendingTools(this.outstanding, message);
 	}
+	/** Live equality includes pending slots: a missing acknowledgement neither
+	 * conceals a rewrite nor invalidates an unchanged tool continuation. */
+	continues(messages: PiMessage[]): boolean {
+		if (this.duplicated || messages.length < this.nextIndex) return false;
+		for (let i = 0; i < this.nextIndex; i++) {
+			const digest = this.recorded.digests[i] ?? this.slots.get(i)?.digest;
+			if (digest === undefined || digestMessage(messages[i]) !== digest) return false;
+		}
+		return true;
+	}
 	/** A receipt binds to the exact slots it delivered. An index already covered,
 	 * or pending with other content, keeps its first snapshot; an identical
 	 * pending slot is shared, and whichever receipt is acknowledged first owns it. */

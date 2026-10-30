@@ -230,6 +230,57 @@ it("an old receipt never records changed content registered later at its index",
 	assert.deepEqual(reverse.recorded.digests, [], "the old copy now duplicates consumed content");
 });
 
+it("continues checks pending input and emitted output before acknowledgement", () => {
+	const ask = user("original");
+	const tool = { role: "assistant", provider: model.provider, timestamp: 1,
+		content: [{ type: "toolCall", id: "X", name: "read", arguments: {} }] };
+	const live = new LiveRecording();
+	live.users([ask], 0, "prompt", false);
+	const index = live.assistant(digestMessage(tool), ["X"]);
+	const check = () => {
+		assert.equal(live.continues([ask, tool, result("X")]), true);
+		assert.equal(live.continues([user("changed"), tool, result("X")]), false);
+		assert.equal(live.continues([ask]), false);
+		assert.equal(live.continues([{ ...ask, timestamp: 2 }, tool, result("X"), user("steer")]), true);
+		const edited = { ...tool, content: [{ ...tool.content[0], arguments: { path: "changed" } }] };
+		assert.equal(live.continues([ask, edited, result("X")]), false);
+	};
+	check();
+	live.acknowledge("prompt");
+	check();
+	live.completeAssistant(index, "assistant");
+	check();
+});
+
+it("continues checks an imported prefix and pending tool results without changing coverage", () => {
+	const ask = user("imported");
+	const imported = { digests: digestMessages([ask]), uuids: ["import"], cuttable: [true] };
+	const live = new LiveRecording(imported);
+	const tr = result("X");
+	live.results([ask, tr]);
+	assert.equal(live.continues([ask, tr, user("next")]), true);
+	assert.equal(live.continues([user("changed"), tr]), false);
+	assert.equal(live.continues([ask, { ...tr, content: [{ type: "text", text: "changed" }] }]), false);
+	assert.deepEqual(live.recorded, imported, "a live match is not a durable acknowledgement");
+	live.result("X", "result");
+	assert.equal(live.continues([ask, tr]), true);
+});
+
+it("continues rejects a gap that cannot establish the live prefix", () => {
+	const live = new LiveRecording();
+	live.gap();
+	assert.equal(live.continues([user("unknown")]), false);
+});
+
+it("continues rejects an acknowledged duplicate not represented in pi history", () => {
+	const messages = [user("prompt")];
+	const live = new LiveRecording();
+	live.users(messages, 0, "first", true);
+	live.users(messages, 0, "duplicate", false);
+	live.acknowledge("duplicate");
+	assert.equal(live.continues(messages), false);
+});
+
 it("re-registering an already covered index leaves history and pending slots untouched", () => {
 	const first = [user("prompt")];
 	const live = new LiveRecording();
