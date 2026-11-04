@@ -31,9 +31,9 @@ kept and read from cache. "Unit" names the tests that pin the row's decision wit
 | 11 | Abort mid-turn, restart | prefix-write | new id, CC's prefix up to the aborted turn | not asserted | `unit-query-lifecycle` (abort), `unit-session-prefix` (row 7) |
 | 12 | `/tree` rewind (no summary) + label, restart | fork | new id, cut before the dropped turn | not asserted | `unit-session-prefix` (row 6 fork) |
 | 13 | Turns on another provider, back to the bridge, restart | prefix-write | new id, bridge prefix kept | hit | `unit-session-prefix` (row 7) |
-| 14 | pi `/fork` of main, first turn | rebuild or clean-start | never main's id; main's CC file byte-identical | not asserted | — |
+| 14 | pi `/fork` of main, first turn | fork | new id from main's state at a cut; main's CC file byte-identical | not asserted | `unit-query-lifecycle` (fork inherits parent state) |
 | 15 | Restart from another dir (`pi --session` restores the session's cwd) | fork | new id, in the session's cwd | hit | `unit-sync-shared-session` ("cwd changes never resume…") |
-| 16 | `context_edit` during a run, restart, then a good run and restart | prefix-write, then fork | new id at the edit, then new id with the whole prefix | hit on the last | `unit-message-digests`, `unit-session-prefix` (row 7) |
+| 16 | `context_edit` during a run, restart, then a good run and restart | fork, then fork (the edit's prefix-write happens within the run) | new id at the edit, then new id with the whole prefix | hit on the last | `unit-message-digests`, `unit-session-prefix` (row 7) |
 | 17 | Restart after the CC session file is deleted | rebuild | new id | not asserted | `unit-sync-shared-session` ("missing files import…") |
 
 ## Layers

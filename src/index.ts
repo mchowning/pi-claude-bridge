@@ -5,12 +5,12 @@ import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@a
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
-import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { createHash, randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
 import { QueryProcess } from "./query-process.js";
-import { readTranscript, resolveRecordingCut, savePrefixSession } from "./session-transcript.js";
+import { readTranscript, recordedToolResults, resolveRecordingCut, savePrefixSession } from "./session-transcript.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
@@ -36,7 +36,7 @@ import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
-import { bridgeRevision, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
+import { BRIDGE_VERSION, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to the bridge log in pi's agent
@@ -284,6 +284,25 @@ function sessionStateFor(piSessionId: string | null | undefined): SessionState |
 	return sharedSessions.get(key) ?? null;
 }
 
+/** A pi fork or clone starts from its parent's state, dirty, so its first turn
+ *  forks the parent's CC session instead of importing pi's history. Memory only:
+ *  the parent's own pointer is saved only once its child exits. */
+function inheritSessionState(parentFile: string, piSessionId: string): void {
+	let text: string;
+	try { text = readFileSync(parentFile, "utf8"); }
+	catch (error) {
+		// pi writes a session file at its first message, so a parent without one has no state.
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	const header = JSON.parse(text.split("\n", 1)[0]);
+	if (header?.type !== "session" || typeof header.id !== "string") throw new Error(`no session header in ${parentFile}`);
+	const parent = sessionStateFor(header.id);
+	if (!parent) return;
+	setSessionStateFor(piSessionId, { ...parent, ...copyRecording(parent), dirtyTail: true });
+	debug(`session_start:fork: inherited ${parent.ccSessionId} from piSession=${header.id} ${sessionTag(piSessionId)}`);
+}
+
 /** Replace (or plant) the mirror for `piSessionId`. */
 function setSessionStateFor(piSessionId: string | null | undefined, state: SessionState | null): void {
 	if (piSessionId != null) knownSessionIds.add(piSessionId);
@@ -359,10 +378,10 @@ function markRebuildForSession(piSession: string | null, event: string): void {
 	const key = sessionKey(piSession);
 	const state = sharedSessions.get(key);
 	if (!state) {
-		debug(`${event}: history rewritten, no session to mark yet`);
+		debug(`${event}: history rewritten, no session to mark yet ${sessionTag(piSession)}`);
 	} else {
 		state.dirtyTail = true;
-		debug(`${event}: marking dirtyTail on session ${state.ccSessionId.slice(0, 8)}`);
+		debug(`${event}: marking dirtyTail on session ${state.ccSessionId.slice(0, 8)} ${sessionTag(piSession)}`);
 	}
 	// Arming parked contexts cannot wait for delivery: the entry checks
 	// `resultCtx.historyStale`, and a rewrite usually lands *while* the query is
@@ -762,6 +781,9 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 }
 
 // Compare pi's values, then retain CC's own records up to the last valid cut.
+// `promptDigest` is the provider's system prompt append; a change takes a full
+// import, the only path on which CC records a new one. AskClaude omits it: it
+// forks with its own append and never commits state.
 function syncSharedSession(
 	messages: Context["messages"],
 	cwd: string,
@@ -771,6 +793,7 @@ function syncSharedSession(
 	traceCallId?: string,
 	writable = piSessionId != null,
 	forkCurrent = false,
+	promptDigest?: string,
 ): SyncResult {
 	let state = piSessionId != null ? sessionStateFor(piSessionId) : null;
 	const before = state;
@@ -792,14 +815,16 @@ function syncSharedSession(
 		}
 	}
 	const cwdChanged = Boolean(state && safeRealpath(state.cwd) !== safeRealpath(cwd));
+	const promptChanged = Boolean(state && promptDigest !== undefined && state.promptDigest !== promptDigest);
+	if (promptChanged) debug(`sync: system prompt append changed; importing pi history ${sessionTag(piSessionId)}`);
 	if (forkCurrent && state && state.model === modelId && !cwdChanged) {
 		Object.assign(compared, compareHistory(state.digests, state));
 	}
-	const row = piSessionId == null ? 0 : !state ? (priors.length ? 2 : 1) : state.model !== modelId ? 3
+	const row = piSessionId == null ? 0 : !state ? (priors.length ? 2 : 1) : state.model !== modelId || promptChanged ? 3
 		: cwdChanged ? 5 : forkCurrent ? (compared.cutCount ? 6 : 5)
 		: compared.equal && !state.dirtyTail ? 4 : !compared.cutCount ? 5 : compared.cutCount === priors.length ? 6 : 7;
 	const reason = piSessionId == null ? "unattributed-history" : missingFile ? "missing-transcript" : !state ? "no-state"
-		: state.model !== modelId ? "model-changed" : cwdChanged ? "cwd-changed" : forkCurrent ? "askclaude-fork"
+		: state.model !== modelId ? "model-changed" : promptChanged ? "prompt-changed" : cwdChanged ? "cwd-changed" : forkCurrent ? "askclaude-fork"
 		: row === 4 ? "equal-digests" : state.dirtyTail && compared.equal ? "dirty-tail" : "history-difference";
 	const decision = (path: string, after: string) => {
 		traceStrict("decision", {
@@ -808,7 +833,7 @@ function syncSharedSession(
 			ccSessionBefore: before?.ccSessionId ?? null, ccSessionAfter: after, priors: priors.length,
 			dirtyTail: Boolean(state?.dirtyTail), missingFile, cwdChanged, cwd, mirrorCwd: before?.cwd ?? null,
 		});
-		debug(`syncResult: path=${path} sessionId=${after} priors=${priors.length} commonPrefix=${compared.commonPrefix} cutCount=${compared.cutCount} row=${row}`);
+		debug(`syncResult: path=${path} sessionId=${after} from=${before?.ccSessionId ?? "none"} priors=${priors.length} commonPrefix=${compared.commonPrefix} cutCount=${compared.cutCount} row=${row} ${sessionTag(piSessionId)}`);
 	};
 	if (row === 4) {
 		decision("reuse", state!.ccSessionId);
@@ -827,13 +852,16 @@ function syncSharedSession(
 			decision("fork", targetSessionId);
 			return { sessionId: state!.ccSessionId, targetSessionId, created: true, forkAt: cut.uuid, recorded, state, writable };
 		}
-		const suffix = importHistory(session, priors.slice(compared.cutCount), customToolNameToSdk, collectCarriedAttachments(transcript.slice(cut.index + 1)));
+		const rest = priors.slice(compared.cutCount);
+		const replaced = transcript.slice(cut.index + 1);
+		const suffix = importHistory(session, rest, customToolNameToSdk, collectCarriedAttachments(replaced), recordedToolResults(replaced, state!.digests, rest));
 		recorded = { digests: [...recorded.digests, ...suffix.digests], uuids: [...recorded.uuids, ...suffix.uuids], cuttable: [...recorded.cuttable, ...suffix.cuttable] };
 		records = savePrefixSession(session, transcript.slice(0, cut.index + 1), cut.uuid);
 	} else {
-		// Nothing is kept, but the old transcript's @file expansions still belong to
-		// prompts pi kept unchanged (placeCarriedAttachments checks each one).
-		recorded = importHistory(session, priors, customToolNameToSdk, state ? collectCarriedAttachments(readTranscript(state)) : []);
+		// Nothing is kept, but the old transcript's @file expansions and tool results
+		// still belong to messages pi kept unchanged.
+		const transcript = state ? readTranscript(state) : [];
+		recorded = importHistory(session, priors, customToolNameToSdk, collectCarriedAttachments(transcript), recordedToolResults(transcript, state?.digests ?? [], priors));
 		session.save();
 		records = session.records.length;
 	}
@@ -1117,12 +1145,18 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 
 // --- Usage helpers ---
 
+// One process serves several pi sessions at once (in-process subagents), so log
+// lines diag/audit-cache.mjs pairs on carry the pi session they belong to.
+function sessionTag(piSessionId: string | null | undefined): string {
+	return `piSession=${piSessionId ?? "none"}`;
+}
+
 // The counter mapping lives in usage.ts; the debug line is this side's job, so every
 // call site logs the same way rather than three times over.
-function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>): void {
+function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null): void {
 	const { cachePct, reasoning } = updateUsage(output, usage, model);
 	const reasoningText = reasoning == null ? "" : ` reasoning=${reasoning}`;
-	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id}`);
+	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id} ${sessionTag(piSessionId)}`);
 }
 
 // Log the *served* context window reported by an SDK result message
@@ -1250,13 +1284,29 @@ function completeAssistantRecording(c: QueryContext, step: AssistantStep): void 
 	} else debug(`recording gap: emitted assistant is not fully covered by completed SDK messages (${step.emitted.ids.join(",")})`);
 }
 
+/** CC took this input into a turn: record it, and drop it from the steers that
+ * keep stdin open. Stdin still stays open until that turn's result, since its
+ * MCP calls need it. Returns whether it was still pending. */
+function incorporate(c: QueryContext, uuid: string): boolean {
+	const recorded = c.recording.acknowledge(uuid);
+	return c.pendingSteerUuids.delete(uuid) || recorded;
+}
+
 /** Recording precedes the UI guard: echoes after a tool boundary still belong
  * to the emitted step, not to whatever stream is currently attached. */
 function tapRecording(message: SDKMessage, names: Map<string, string>, c: QueryContext): void {
 	if ((message.type === "assistant" && message.parent_tool_use_id === null && message.message.model !== "<synthetic>")
-		|| (message.type === "stream_event" && message.parent_tool_use_id === null && ["content_block_start", "content_block_delta"].includes(message.event.type))) c.recording.assistantObserved();
+		|| (message.type === "stream_event" && message.parent_tool_use_id === null && ["content_block_start", "content_block_delta"].includes(message.event.type))) {
+		c.recording.assistantObserved();
+		// CC persists a turn's opening input before calling the API but never
+		// replays one holding its own tags (e.g. <task-notification>), so the turn's
+		// first output incorporates it.
+		if (c.turnOpener && incorporate(c, c.turnOpener)) debug(`recording: turn opener ${c.turnOpener} was never replayed; its first output acknowledges it`);
+		c.turnOpener = undefined;
+	}
+	if (message.type === "result") c.turnOpener = c.pendingSteerUuids.values().next().value;
 	if (message.type === "user" && message.parent_tool_use_id === null && message.uuid) {
-		if ("isReplay" in message && message.isReplay === true) c.recording.acknowledge(message.uuid);
+		if ("isReplay" in message && message.isReplay === true) incorporate(c, message.uuid);
 		if (Array.isArray(message.message.content)) for (const block of message.message.content) {
 			if (block.type === "tool_result") c.recording.result(block.tool_use_id, message.uuid);
 		}
@@ -1318,7 +1368,7 @@ function processStreamEvent(
 		if (c.turnStreamMessageId && !c.turnAssistantIds.includes(c.turnStreamMessageId)) c.turnAssistantIds.push(c.turnStreamMessageId);
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
-		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model);
+		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model, c.piSessionId);
 		return;
 	}
 
@@ -1394,7 +1444,7 @@ function processStreamEvent(
 
 	if (event?.type === "message_delta") {
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		if (event.usage) recordUsage(c.turnOutput, event.usage, model);
+		if (event.usage) recordUsage(c.turnOutput, event.usage, model, c.piSessionId);
 		return;
 	}
 
@@ -1503,7 +1553,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.type === "text" && block.text) c.turnBlocks.push({ type: "text", text: block.text });
 			else debug("processAssistantMessage: unhandled <synthetic> block type", block.type);
 		}
-		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
+		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId);
 		return;
 	}
 	const id = assistantMsg.id;
@@ -1559,7 +1609,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
 	}
-	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model);
+	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId);
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) {
@@ -1606,8 +1656,6 @@ async function consumeQuery(
 		// nowhere to put once a turn has ended on a tool call. Handle lifecycle
 		// messages before that gate:
 		//
-		// - replay acknowledgements: clear a queued steer even after its pi turn
-		//   stream has ended.
 		// - stdin: nothing else closes the CLI's stdin now that the prompt is a
 		//   streamed generator (isSingleUserTurn=false), so missing this hangs the query.
 		// - the failure a `result` carries: it is the only record that the turn
@@ -1616,11 +1664,6 @@ async function consumeQuery(
 		//   open; once ended, turnOutput is the message pi already recorded.
 		// - rate-limit events: notifications to the user, which are most likely to
 		//   fire during exactly the long tool-using turns the guard was skipping.
-		if (message.type === "user" && message.parent_tool_use_id === null && "isReplay" in message && message.isReplay === true) {
-			// For fresh steer UUIDs, replay marks incorporation into the turn, not
-			// completion. Its MCP calls still need stdin until the following result.
-			queryCtx.pendingSteerUuids.delete(message.uuid);
-		}
 		if (message.type === "stream_event" && (message as any).event?.type === "message_start") {
 			const started = (message as any).event.message;
 			traceEvent("api-message", { queryId: traceQueryId, apiMessageId: started?.id ?? null, model: started?.model ?? null, usage: started?.usage ?? null });
@@ -1667,11 +1710,11 @@ async function consumeQuery(
 				queryCtx.lastRateLimitWarnStep = null;
 				queryCtx.lastRateLimitWarnThreshold = undefined;
 				// resetsAt is Unix seconds, not milliseconds.
-				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
+				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : undefined;
 				// isUsingOverage: the plan limit is hit but Extra Usage is serving (and billing) requests.
 				piUI?.notify(info.isUsingOverage
-					? `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — requests are now billed to Extra Usage until ${resetsAt}`
-					: `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+					? `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — requests are now billed to Extra Usage${resetsAt ? ` until ${resetsAt}` : ""}`
+					: `Claude subscription rate limit reached (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt ?? "unknown"}`, "warning");
 			} else if (info?.status === "allowed") {
 				// Back under the threshold (window reset) — re-arm the warning dedupe.
 				queryCtx.lastRateLimitWarnStep = null;
@@ -1942,13 +1985,22 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// AgentSession, sharing this process) must not discard the parent's parked
 	// query, and vice versa. Extensions can also edit the selected history without
 	// a rewrite event; compare the live prefix before feeding this query a result.
-	let rewrittenUnderQuery: boolean;
+	let divergence: ReturnType<LiveRecording["divergence"]>;
 	try {
-		rewrittenUnderQuery = Boolean(resultCtx && (resultCtx.historyStale
-			|| !resultCtx.recording.continues(nonSystemMessages(context.messages))));
-	} catch (error) { return failBeforeQuery(error); }
+		divergence = resultCtx && !resultCtx.historyStale ? resultCtx.recording.divergence(nonSystemMessages(context.messages)) : undefined;
+	} catch (error) {
+		// A history that can't be checked can't continue the query either.
+		traceEvent("route", { callId: traceCallId, route: "discard-rewritten", queryId: resultCtx!.traceQueryId, reason: "digest-error" });
+		try { discardRewrittenQuery(resultCtx!); }
+		catch (discardError) { return failBeforeQuery(discardError); }
+		return failBeforeQuery(error);
+	}
+	const rewrittenUnderQuery = Boolean(resultCtx && (resultCtx.historyStale || divergence !== undefined));
 	if (resultCtx && rewrittenUnderQuery) {
-		traceEvent("route", { callId: traceCallId, route: "discard-rewritten", queryId: resultCtx.traceQueryId });
+		traceEvent("route", {
+			callId: traceCallId, route: "discard-rewritten", queryId: resultCtx.traceQueryId,
+			reason: resultCtx.historyStale ? "rewrite-event" : "history-diverged", divergence,
+		});
 		try { discardRewrittenQuery(resultCtx); }
 		catch (error) { return failBeforeQuery(error); }
 		resultCtx = undefined;
@@ -2088,7 +2140,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// Read before the consume below: with no query parked (an overflow retried
 		// after compaction), the session's mark is the only sign of the rewrite.
 		const historyRewritten = rewrittenUnderQuery || (piSessionId !== null && historyRewrittenBySession.has(piSessionId));
-		const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId);
+		const promptDigest = createHash("sha256").update(systemPromptAppend ?? "").digest("hex");
+		const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId, undefined, false, promptDigest);
 		if (syncResult.created) createdBeforeLaunch = { id: syncResult.targetSessionId, cwd };
 		// This query starts from the history pi has now: consume this session's
 		// armed rewrite — a sibling pi session's stays armed for its own queries.
@@ -2139,8 +2192,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// instruction belongs to the following assistant's boundary, not the
 		// imported prior result: cuts before that assistant stop before the prompt.
 		// Like a steer, the prompt is recorded only on CC's replay acknowledgement
-		// (tapRecording): a stdin write does not prove CC persisted its record.
+		// or, when CC never replays it, on the query's first output (tapRecording):
+		// a stdin write does not prove CC persisted its record.
 		recording.users(context.messages, turnStart(context.messages), promptUuid, false, false);
+		queryCtx.turnOpener = promptUuid;
 		void promptStream.push({ ...userMessage(promptBlocks ?? [{ type: "text", text: promptText }]), uuid: promptUuid })
 			.catch((error) => debug(`provider: initial prompt push rejected:`, error));
 		queryCtx.promptStream = promptStream;
@@ -2223,7 +2278,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		debug("provider: fresh query",
 			`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 			`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-			`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
+			`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled} ${sessionTag(queryCtx.piSessionId)}`,
 			`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
 		// 3. Start SDK query and claim it for this context
@@ -2248,8 +2303,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// authoritative at once; the file is saved after exit (persistRecording).
 		const commitRecording = (dirty: boolean) => {
 			stopWriting();
+			// Costs the next turn a prefix-write; diag/audit-cache.mjs fails on it.
+			if (!dirty && (recording.hasGaps || (syncResult.created && !recording.hasProgress))) debug(`recording: clean end left messages unrecorded ${sessionTag(piSessionId)}`);
 			if (!syncResult.writable || sessionStateFor(piSessionId) !== expectedState || (syncResult.created && !recording.hasProgress)) return;
-			const state: SessionState = { ...copyRecording(recording.recorded), ccSessionId: syncResult.targetSessionId, cwd, model: cliModel,
+			const state: SessionState = { ...copyRecording(recording.recorded), ccSessionId: syncResult.targetSessionId, cwd, model: cliModel, promptDigest,
 				dirtyTail: dirty || queryCtx.historyStale || recording.hasGaps };
 			setSessionStateFor(piSessionId, state);
 			expectedState = unsaved = state;
@@ -2620,8 +2677,7 @@ let askClaudeToolName = "AskClaude";
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig(process.cwd());
 	let askClaudeDeprecationNoticeShown = Boolean(config.askClaudeDeprecationShown);
-	const rev = bridgeRevision();
-	debug(`bridge: version=${rev.version} commit=${rev.revision?.slice(0, 8)} dirty=${Boolean(rev.dirty)} sdk=${packageVersion("@anthropic-ai/claude-agent-sdk")} pi=${PI_VERSION}`);
+	debug(`bridge: version=${BRIDGE_VERSION} sdk=${packageVersion("@anthropic-ai/claude-agent-sdk")} pi=${PI_VERSION}`);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
@@ -2644,12 +2700,11 @@ export default function (pi: ExtensionAPI) {
 		pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
 	}
 
-	// Pi session lifecycle events: drop rewrite marks and the stream registration
+	// Pi session lifecycle events: drop the stream registration
 	const clearSession = (event: string) => {
-		// Mirrors stay: each is keyed by its own pi session id and matches its
-		// persisted pointer, so switching to another session erases none of them.
+		// Mirrors and rewrite marks stay: each is keyed by its own pi session id,
+		// so switching sessions or another session's shutdown erases none of them.
 		debug(`${event}: retaining ${sharedSessions.size} shared session${sharedSessions.size === 1 ? "" : "s"}`);
-		historyRewrittenBySession.clear();
 
 		// Clear the global streamSimple if this instance registered it.
 		// This allows /reload to work — the old instance clears the flag so
@@ -2667,6 +2722,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
+		if (event.reason === "fork" && event.previousSessionFile) inheritSessionState(event.previousSessionFile, ctx.sessionManager.getSessionId());
 	});
 	pi.on("session_before_compact", (event, ctx) => {
 		rememberSummarySession(event.signal, ctx.sessionManager.getSessionId());
@@ -2768,8 +2824,10 @@ export default function (pi: ExtensionAPI) {
 	// Claude Code models expect bash to time out (CC's default is 120s); pi's bash has none.
 	// Set it on the execution copy pi hands tool_call handlers, not in the stored call, so
 	// pi's history keeps the arguments CC sent and a rebuild matches CC's records (#203).
+	// A `background: true` call (added by an extension) doesn't block the turn, so it gets no default.
 	pi.on("tool_call", (event, ctx) => {
-		if (isToolCallEventType("bash", event) && event.input.timeout == null && ctx.model?.provider === PROVIDER_ID) {
+		if (isToolCallEventType("bash", event) && event.input.timeout == null && ctx.model?.provider === PROVIDER_ID
+			&& (event.input as { background?: unknown }).background !== true) {
 			event.input.timeout = 120;
 		}
 	});

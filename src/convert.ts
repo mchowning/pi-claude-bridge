@@ -2,7 +2,7 @@
 // Extracted so they can be tested without pulling in the full extension runtime.
 
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
-import type { Message as SessionMessage } from "cc-session-io";
+import type { Message as SessionMessage, ToolResultBlock } from "cc-session-io";
 import { pascalCase } from "change-case";
 import { MCP_TOOL_PREFIX } from "./skills.js";
 
@@ -90,10 +90,12 @@ function toolResultContent(
 	return blocks;
 }
 
-/** Convert pi message array to Anthropic API format. */
+/** Convert pi message array to Anthropic API format. `recorded` replaces a tool
+ * result, by pi tool call id, with the block Claude Code recorded for it. */
 export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk?: Map<string, string>,
+	recorded: ReadonlyMap<string, ToolResultBlock> = new Map(),
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; origins: number[][] } {
 	const anthropicMessages: SessionMessage[] = [];
 	const sources = new Map<SessionMessage, number[]>();
@@ -105,7 +107,7 @@ export function convertPiMessages(
 	// The user message collecting this assistant turn's tool results, if one has
 	// been emitted yet, and the index of the assistant message it belongs to. Both
 	// are cleared at every assistant message — see the toolResult branch.
-	let turnResults: { role: "user"; content: Array<Record<string, unknown>> } | null = null;
+	let turnResults: { role: "user"; content: Array<ToolResultBlock | Record<string, unknown>> } | null = null;
 	let turnAssistantIdx: number | null = null;
 
 	for (const [piIndex, msg] of messages.entries()) {
@@ -194,7 +196,9 @@ export function convertPiMessages(
 			// reorderAttachmentsForAPI (claude-code-rip src/utils/messages.ts:1481)
 			// bubbles attachments up to the nearest assistant or tool_result message
 			// and re-inserts them after it. The on-disk form differs, the order does not.
-			const block = { type: "tool_result", tool_use_id: sanitizeToolId(msg.toolCallId, sanitizedIds), content: toolResultContent(msg.content), is_error: msg.isError };
+			const id = sanitizeToolId(msg.toolCallId, sanitizedIds);
+			const block = recorded.get(msg.toolCallId)
+				?? { type: "tool_result", tool_use_id: id, content: toolResultContent(msg.content), ...(msg.isError ? { is_error: true } : {}) };
 			if (turnResults) {
 				turnResults.content.push(block);
 				sources.get(turnResults as unknown as SessionMessage)!.push(piIndex);

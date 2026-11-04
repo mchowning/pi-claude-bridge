@@ -35,7 +35,7 @@ afterEach(() => {
 /** Main's CC session on disk and its saved state, as after a finished main turn. */
 function seedMain() {
 	const session = createSession({ projectPath: cwd, model: "sonnet" });
-	const state = stateFor(session, history, "sonnet");
+	const state = stateFor(session, history, "sonnet", { promptDigest: "p1" });
 	session.save();
 	saveSessionState(MAIN, state);
 	return { session, state };

@@ -230,7 +230,8 @@ const ROWS = {
 		await f.prompt(P.plain(3));
 		const o = f.observe(m);
 		const unchanged = mainBytes !== null && readFileSync(mainFile, "utf8") === mainBytes;
-		return { o, checks: { "path rebuild or clean-start": o.path === "rebuild" || o.path === "clean-start", "not main's CC session": o.ccSession !== main, "main's CC file unchanged": unchanged } };
+		// A pi fork inherits main's state, dirty, so its first turn forks main's CC session at a cut.
+		return { o, checks: { "path fork": o.path === "fork", "not main's CC session": o.ccSession !== main, "main's CC file unchanged": unchanged } };
 	} },
 	15: { name: "restart-from-another-dir", async run(f) {
 		// pi --session restores the session's recorded cwd, so the turn (and CC) stay in the
@@ -254,7 +255,8 @@ const ROWS = {
 		await f.restart(); await f.prompt(P.plain(5));
 		const o2 = f.observe(m2);
 		return { o: { afterEdit: o1, afterRecovery: o2 }, checks: {
-			"after the edit: prefix-write": o1.path === "prefix-write",
+			// The edit discards the parked query and prefix-writes within the run, so the restart forks.
+			"after the edit: fork": o1.path === "fork",
 			"after recovery: fork": o2.path === "fork", "after recovery: new CC session": o2.ccSession !== before, "after recovery: cache hit": hit(o2.cache),
 		} };
 	} },

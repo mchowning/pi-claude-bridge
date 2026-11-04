@@ -637,7 +637,8 @@ test("a truncating fork preserves parallel results outside the leaf's parent pat
 	const options = providerOptions({
 		cwd, maxTurns: 3,
 		mcpServers: toolServer([noArgTool("alpha"), noArgTool("beta")], calls),
-		env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0" },
+		// As in production: otherwise CC's session-title request takes the stub's tool calls.
+		env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_ELEGANT_MEADOW: "0", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
 	});
 	try {
 		const seed = await collect(query({ prompt: "Call alpha and beta in parallel.", options }));
@@ -711,6 +712,55 @@ test("a steer replayed after a completed turn has its own user record after that
 		const steerAt = session.records.findIndex((r) => r.uuid === steerUuid);
 		assert.ok(firstAt >= 0 && steerAt > firstAt, "late steer must follow the already completed assistant");
 		assert.equal(session.records[steerAt].type, "user", "a later-turn steer is a user record, not a queued_command attachment");
+		assert.ok(requests.some((r) => JSON.stringify(r.messages).includes("LATE-STEER")));
+	} finally {
+		release();
+		api.close();
+		rmSync(getProjectDir(cwd, process.env.CLAUDE_CONFIG_DIR), { recursive: true, force: true });
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("a turn's opening input containing <task-notification> is recorded under its UUID but never replayed", { timeout: 120_000 }, async () => {
+	// Both the query's prompt and a late steer CC runs as a later turn. The bridge
+	// acknowledges each at its turn's first output instead (tapRecording), or the
+	// pending steer would hold stdin open forever.
+	const requests = [];
+	const api = await stubApi(requests);
+	const cwd = mkdtempSync(join(tmpdir(), "cc-tag-input-"));
+	const sessionId = randomUUID();
+	const uuids = [randomUUID(), randomUUID()];
+	const tagged = (text) => `<task-notification>\n<task-id>abc</task-id>\n<status>Done</status>\n</task-notification>\n${text}`;
+	let release;
+	const completed = new Promise((resolve) => { release = resolve; });
+	async function* prompts() {
+		yield { type: "user", message: { role: "user", content: tagged("Reply OK.") }, parent_tool_use_id: null, uuid: uuids[0] };
+		await completed;
+		yield { type: "user", message: { role: "user", content: tagged("Reply OK to LATE-STEER.") }, parent_tool_use_id: null, uuid: uuids[1], priority: "next" };
+	}
+	try {
+		const messages = [];
+		let results = 0;
+		for await (const message of query({
+			prompt: prompts(),
+			options: providerOptions({
+				cwd, sessionId,
+				extraArgs: { "strict-mcp-config": null, "replay-user-messages": null },
+				env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
+			}),
+		})) {
+			messages.push(message);
+			if (message.type === "result" && ++results === 1) release();
+		}
+		assert.equal(results, 2, "both turns must complete");
+		assert.ok(!messages.some((m) => m.type === "user" && m.isReplay && uuids.includes(m.uuid)), "CC replayed input holding <task-notification>; the first-output acknowledgement is no longer needed");
+		const session = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const at = (uuid) => session.records.findIndex((r) => r.uuid === uuid);
+		const split = messages.findIndex((m) => m.type === "result");
+		const outputs = [messages.slice(0, split), messages.slice(split)].map((turn) => turn.find((m) => m.type === "assistant"));
+		for (const [turn, uuid] of uuids.entries()) {
+			assert.ok(at(uuid) >= 0 && at(uuid) < at(outputs[turn].uuid), `turn ${turn + 1}'s input must be recorded under its supplied UUID before its output`);
+		}
 		assert.ok(requests.some((r) => JSON.stringify(r.messages).includes("LATE-STEER")));
 	} finally {
 		release();
@@ -825,7 +875,9 @@ test("routing through the capture proxy does not change what CC sends", { timeou
 			options: providerOptions({
 				maxTurns: 1, persistSession: false, includePartialMessages: true,
 				mcpServers: toolServer([noArgTool("alpha")], []),
-				env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", ...extraEnv },
+				// As in production: otherwise CC's server-flag defaults add a token-countdown
+				// reminder on a direct connection only.
+				env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", ...extraEnv },
 			}),
 		});
 		for await (const message of q) {
