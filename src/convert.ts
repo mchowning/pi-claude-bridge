@@ -3,16 +3,9 @@
 
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
 import type { Message as SessionMessage, ToolResultBlock } from "cc-session-io";
-import { pascalCase } from "change-case";
 import { MCP_TOOL_PREFIX } from "./skills.js";
 
 export const PROVIDER_ID = "claude-bridge";
-
-// Pi tool names under Claude Code's builtin names. Only ever correct on the
-// AskClaude path, where CC runs its own tools — see mapPiToolNameToSdk.
-export const PI_TO_SDK_TOOL_NAME: Record<string, string> = {
-	read: "Read", write: "Write", edit: "Edit", bash: "Bash",
-};
 
 export function sanitizeToolId(id: string, cache: Map<string, string>): string {
 	const existing = cache.get(id);
@@ -24,23 +17,20 @@ export function sanitizeToolId(id: string, cache: Map<string, string>): string {
 
 /** A pi tool name as the name a rebuilt transcript has to call it by.
  *
- *  Whether a map is passed is what distinguishes the two query shapes, because
- *  they need opposite answers:
+ *  On the provider path the query runs `tools: []`, so every tool Claude can
+ *  call is a pi tool served over MCP, and its name is `mcp__custom-tools__<pi name>`
+ *  by construction (resolveMcpTools). The map is consulted first only because it
+ *  carries the served tool's exact casing. A name it lacks is a tool pi ran that
+ *  we do not serve now (an extension since disabled), and naming that after a
+ *  Claude Code builtin would tell the model a builtin it cannot call is available
+ *  and was already used. That is the prompt condition behind the phantom-call
+ *  deadlock fixed in 122914dd, and the read direction refuses the same names for
+ *  the same reason (piToolNameFor in index.ts).
  *
- *  - **With a map — the provider path.** The query runs `tools: []`, so every
- *    tool Claude can call is a pi tool served over MCP, and its name is
- *    `mcp__custom-tools__<pi name>` by construction (resolveMcpTools). The map
- *    is consulted first only because it carries the served tool's exact casing.
- *    A name it lacks is a tool pi ran that we do not serve now — AskClaude,
- *    excluded on purpose, or an extension since disabled — and naming that after
- *    a Claude Code builtin would tell the model a builtin it cannot call is
- *    available and was already used. That is the prompt condition behind the
- *    phantom-call deadlock fixed in 122914dd, and the read direction refuses the
- *    same names for the same reason (piToolNameFor in index.ts).
- *  - **Without a map — the AskClaude path.** CC runs its own tools there, so
- *    builtin names are real, matching mapToolName in the other direction.
+ *  The AskClaude package has a trimmed copy of this conversion
+ *  (askclaude/src/claude-code.ts).
  */
-export function mapPiToolNameToSdk(name: string, customToolNameToSdk?: Map<string, string>): string {
+function mapPiToolNameToSdk(name: string, customToolNameToSdk: ReadonlyMap<string, string> = new Map()): string {
 	if (!name) return "";
 	const normalized = name.toLowerCase();
 	// Pi history holds pi tool names. Our own SDK prefix can only reach here by
@@ -49,7 +39,6 @@ export function mapPiToolNameToSdk(name: string, customToolNameToSdk?: Map<strin
 	if (normalized.startsWith(MCP_TOOL_PREFIX)) {
 		throw new Error(`mapPiToolNameToSdk: "${name}" is already an SDK tool name — pi history holds pi tool names`);
 	}
-	if (!customToolNameToSdk) return PI_TO_SDK_TOOL_NAME[normalized] ?? pascalCase(name);
 	return customToolNameToSdk.get(name) ?? customToolNameToSdk.get(normalized) ?? `${MCP_TOOL_PREFIX}${name}`;
 }
 
@@ -90,11 +79,22 @@ function toolResultContent(
 	return blocks;
 }
 
+/** Claude Code never sends an empty tool result: live, it substitutes these placeholders
+ *  (tests/int-cc-contracts.mjs pins them), and the API rejects an empty one marked is_error. */
+function nonEmptyToolResultContent(
+	msg: Extract<PiMessage, { role: "toolResult" }>,
+	customToolNameToSdk: ReadonlyMap<string, string>,
+): string | Array<Record<string, unknown>> {
+	const content = toolResultContent(msg.content);
+	if (typeof content !== "string" || content.trim()) return content;
+	return msg.isError ? "Command failed with no output" : `(${mapPiToolNameToSdk(msg.toolName, customToolNameToSdk)} completed with no output)`;
+}
+
 /** Convert pi message array to Anthropic API format. `recorded` replaces a tool
  * result, by pi tool call id, with the block Claude Code recorded for it. */
 export function convertPiMessages(
 	messages: PiMessage[],
-	customToolNameToSdk?: Map<string, string>,
+	customToolNameToSdk: ReadonlyMap<string, string> = new Map(),
 	recorded: ReadonlyMap<string, ToolResultBlock> = new Map(),
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; origins: number[][] } {
 	const anthropicMessages: SessionMessage[] = [];
@@ -198,7 +198,7 @@ export function convertPiMessages(
 			// and re-inserts them after it. The on-disk form differs, the order does not.
 			const id = sanitizeToolId(msg.toolCallId, sanitizedIds);
 			const block = recorded.get(msg.toolCallId)
-				?? { type: "tool_result", tool_use_id: id, content: toolResultContent(msg.content), ...(msg.isError ? { is_error: true } : {}) };
+				?? { type: "tool_result", tool_use_id: id, content: nonEmptyToolResultContent(msg, customToolNameToSdk), ...(msg.isError ? { is_error: true } : {}) };
 			if (turnResults) {
 				turnResults.content.push(block);
 				sources.get(turnResults as unknown as SessionMessage)!.push(piIndex);

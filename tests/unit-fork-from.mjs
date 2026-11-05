@@ -62,7 +62,7 @@ describe("fork from another session", () => {
 		const mainBytes = readFileSync(session.jsonlPath, "utf8");
 
 		assert.equal(__test.adoptForkFrom(session.sessionId, FORK), true);
-		const result = __test.syncSharedSession([...history, user("You are answering a review comment.")], cwd, undefined, "sonnet", FORK);
+		const result = __test.syncSharedSession([...history, user("You are answering a review comment.")], cwd, new Map(), "sonnet", FORK, undefined, "p1");
 
 		assert.equal(result.sessionId, session.sessionId, "resumes main's session");
 		assert.ok(result.forkAt, "as a fork at a cut, not a plain resume that would append to main's file");
