@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { isToolCallEventType, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { isToolCallEventType, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { query, type EffortLevel, type SDKMessage, type SettingSource, type ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
 import { createHash, randomUUID } from "node:crypto";
@@ -20,7 +20,7 @@ import { compareHistory, copyRecording, importHistory, LiveRecording, type Recor
 import { deleteSessionState, loadSessionState, loadSessionStateByCcSession, saveSessionState } from "./session-store.js";
 import { newAssistantOutput, QueryContext, type AssistantStep } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
-import { claudeCodeSettings, globalConfigPath, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
+import { claudeCodeSettings, globalConfigPath, loadConfig, type Config } from "./config.js";
 import {
 	projectPromptCapture,
 	sharedPromptCaptures,
@@ -378,7 +378,8 @@ async function runIsolatedSummary(
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		// Honour the caller's reasoning level, same mapping as the provider path.
 		const effort = effortForReasoning(model, options?.reasoning);
-		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"} promptLen=${promptText.length}`);
+		const thinking = thinkingForReasoning(model, options?.reasoning);
+		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"}${thinking ? " thinking=disabled" : ""} promptLen=${promptText.length}`);
 
 		sdkQuery = queryImpl({
 			prompt: promptText,
@@ -395,6 +396,7 @@ async function runIsolatedSummary(
 				model: cliModel,
 				maxTurns: 1,
 				...(effort ? { effort } : {}),
+				...(thinking ? { thinking } : {}),
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 				...makeCliDebugOptions("compact-summary"),
 			},
@@ -677,6 +679,7 @@ export const __test = {
 	toBridgeContext,
 	isolatedStreamFn,
 	effortForReasoning,
+	thinkingForReasoning,
 	syncSharedSession,
 	extractUserPromptBlocks,
 	consumeQuery,
@@ -751,33 +754,11 @@ setTraceNotifier((message) => {
 	debug(message);
 	piUI?.notify(message, "error");
 });
-let piMode: ExtensionContext["mode"] | null = null;
 const activeQueryContexts = new Set<QueryContext>();
 
-// Defaults that silently cost the user something (no Opus 1M on Max) are
-// announced once. Deferred to the first bridge query rather
-// than session_start: the notice persists a flag to the global config, and
-// firing it on startup would write that file for every pi session that merely
-// has this extension installed. One message, because consecutive info notifies
-// overwrite each other in the TUI.
-let pendingNotices: string[] = [];
 // Whoever had the old askClaude setting on lost the tool on upgrade. Warned at most once
 // per module instance, which pi's per-session reruns of the factory below share.
 let askClaudeWarningShown = false;
-
-function showStartupNoticeOnce(): void {
-	// `hasUI` is true in RPC mode too — it means dialogs are possible, not that a
-	// human is watching. Only a terminal user can act on this.
-	if (pendingNotices.length === 0 || piMode !== "tui") return;
-	const notices = pendingNotices;
-	pendingNotices = [];
-	const path = markStartupNoticeShown();
-	// pi wraps the whole notify string in the theme's dim foreground; the inner reset
-	// drops back to the terminal default rather than dim, which is fine here.
-	const title = `\x1b[33mWelcome to pi-claude-bridge\x1b[39m — settings live in ${path}`;
-	const bullets = [...notices, "This message only appears once. See README.md for more."].map((n) => `• ${n}`);
-	piUI?.notify([title, ...bullets, "─".repeat(64)].join("\n"), "info");
-}
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
 // is keyed rather than held in a single slot. One process-wide instance, shared
@@ -935,6 +916,15 @@ function effortForReasoning(model: Model<any>, reasoning: string | undefined): E
 	const mapped = model.thinkingLevelMap?.[reasoning];
 	if (mapped === undefined) return REASONING_TO_EFFORT[reasoning];
 	return VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined;
+}
+
+// Pi sends no reasoning level when thinking is off, and Claude Code then applies
+// its own default (thinking on). Disable thinking the way pi-ai's Anthropic
+// provider does: for reasoning models, unless the model's thinkingLevelMap marks
+// "off" unsupported (null), as on models that always think.
+function thinkingForReasoning(model: Model<any>, reasoning: string | undefined): ThinkingConfig | undefined {
+	if (reasoning || !model.reasoning || model.thinkingLevelMap?.off === null) return undefined;
+	return { type: "disabled" };
 }
 
 // --- Provider helpers: misc ---
@@ -1197,9 +1187,16 @@ function processStreamEvent(
 			c.currentPiStream!.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: c.turnOutput });
 		} else if (block.type === "toolCall") {
 			c.turnSawToolCall = true;
-			block.arguments = mapToolArgs(
-				block.name, parsePartialJson(block.partialJson, block.arguments),
-			);
+			// CC's finished tool_use (already in assistantSteps) carries the input it
+			// runs and records, e.g. "5" converted for an integer param. Copied so pi
+			// can change its arguments without changing the recorded step.
+			const finished = c.assistantSteps.get(c.turnStreamMessageId!)?.content
+				.find((b): b is Extract<typeof b, { type: "toolCall" }> => b.type === "toolCall" && b.id === block.id);
+			if (finished) block.arguments = { ...finished.arguments };
+			else {
+				debug(`WARNING: Claude Code's finished tool_use ${block.id} did not arrive before content_block_stop; keeping the streamed arguments`);
+				block.arguments = mapToolArgs(block.name, parsePartialJson(block.partialJson, block.arguments));
+			}
 			delete block.partialJson;
 			c.currentPiStream!.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: c.turnOutput });
 		}
@@ -1660,7 +1657,6 @@ function dropParkedQuery(c: QueryContext): void {
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	showStartupNoticeOnce();
 	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
 	// back out to the prompt/tools fields every syncSharedSession call and
 	// prompt-capture lookup below assumes (issue #106).
@@ -1916,6 +1912,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
 		const effort = effortForReasoning(model, options?.reasoning);
+		const thinking = thinkingForReasoning(model, options?.reasoning);
 
 		const extraArgs: Record<string, string | null> = { "replay-user-messages": null };
 		// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
@@ -1973,6 +1970,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			strictMcpConfig: strictMcpConfigEnabled,
 			extraArgs,
 			...(effort ? { effort } : {}),
+			...(thinking ? { thinking } : {}),
 			...(mcpServers ? { mcpServers } : {}),
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(syncResult.forkAt ? { forkSession: true, resumeSessionAt: syncResult.forkAt } : {}),
@@ -2173,7 +2171,7 @@ export default function (pi: ExtensionAPI) {
 	debug(`bridge: version=${BRIDGE_VERSION} sdk=${packageVersion("@anthropic-ai/claude-agent-sdk")} pi=${PI_VERSION}`);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
-	// We need these settings to know if we're eligible for 1M context on certain models
+	// Opus 4.6 and Sonnet 4.6 need these settings to know if they're eligible for 1M context
 	// Validate at the boundary: a non-array here would throw inside every
 	// claudeCodeModelId call and brick the extension at activation.
 	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
@@ -2187,10 +2185,6 @@ export default function (pi: ExtensionAPI) {
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
 	if (registeredModels.length === 0) {
 		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.86.1)");
-	}
-
-	if (!config.startupNoticeShown && config.provider?.plan === undefined) {
-		pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
 	}
 
 	// Pi session lifecycle events: drop the stream registration
@@ -2210,7 +2204,6 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
-		piMode = ctx.mode;
 		rememberSessionCwd(ctx.sessionManager.getSessionId(), ctx.cwd);
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
