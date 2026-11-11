@@ -59,7 +59,10 @@ export default function cacheFlowsExtension(pi: ExtensionAPI) {
 	const other = createFauxCore({
 		api: "flows-other",
 		provider: "flows-other",
-		models: [{ id: "other-1", name: "Other", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 4_096 }],
+		// reasoning: true so switching here and back keeps pi's thinking level. A non-reasoning
+		// model clamps it to off, and since #152 the bridge then disables thinking, which
+		// changes the request and misses the message cache (row 13).
+		models: [{ id: "other-1", name: "Other", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 200_000, maxTokens: 4_096 }],
 	});
 	pi.registerProvider("flows-other", {
 		baseUrl: "http://localhost:0",
