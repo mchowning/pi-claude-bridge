@@ -1,5 +1,18 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: tool calls rejected by Claude Code no longer hang the turn (#218)** — We now fail the turn if a tool call is rejected (e.g. because Claude Code permission hook blocked). Running tools are not canceled or undone. Unknown and wrong-case tool names are intentionally ignored so CC can retry itself. If CC sends invalid arguments it can now require a new user prompt to continue. Thanks @sonSunnoi.
+- **Add: Claude Mythos 5.2 and 5.1 with 1M context (#259)** — pi-ai doesn't list these access-gated models, so the bridge now adds them, cloned from the Fable releases they shipped beside. Measured at 1M on Max. Listed last in `/model`; requests fail on accounts without Mythos access. Thanks @borski.
+
+## 0.12.0 — 2026-11-10
+
+- **Add: Claude Fable 5.2 with 1M context** — Agent SDK bumped to 0.3.321 (Claude Code 2.1.321), which knows Fable 5.2; AskClaude's too.
+- **Bump: require pi ≥1.5.1** — Also for AskClaude.
+- **Remove: the system prompt guard** — pi 1.5's prompt no longer trips Anthropic's third-party billing check.
+- **Add: warn when an extension's per-request message keeps rewriting the prompt cache (#246)** — A message added to every request but never saved (for example from a `context` hook, as pi-todo-rail does) makes each request rewrite the whole cache; the bridge now says so once, quoting the message.
+- **Add: warn when Extra Usage is billed with plan limits left** — Claude Code's `overageInUse` without a reached plan limit, or an "out of extra usage" error with none, now points at the system prompt.
+
 ## 0.11.0 — 2026-11-06
 
 - **Breaking: AskClaude moved to its own package** — Run `pi install npm:pi-claude-bridge-askclaude` if you want to keep using the AskClaude tool.
